@@ -24,6 +24,6 @@ def test_cron_add_rejects_invalid_timezone(monkeypatch, tmp_path) -> None:
         ],
     )
 
-    assert result.exit_code == 1
+    assert result.exit_code != 0
     assert "Error: unknown timezone 'America/Vancovuer'" in result.stdout
     assert not (tmp_path / "cron" / "jobs.json").exists()

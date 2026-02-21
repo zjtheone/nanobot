@@ -15,15 +15,15 @@ from nanobot.providers.registry import find_by_model, find_gateway
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
-    
+
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
     """
-    
+
     def __init__(
-        self, 
-        api_key: str | None = None, 
+        self,
+        api_key: str | None = None,
         api_base: str | None = None,
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
@@ -32,24 +32,24 @@ class LiteLLMProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
-        
+
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
         # api_key / api_base are fallback for auto-detection.
         self._gateway = find_gateway(provider_name, api_key, api_base)
-        
+
         # Configure environment variables
         if api_key:
             self._setup_env(api_key, api_base, default_model)
-        
+
         if api_base:
             litellm.api_base = api_base
-        
+
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
-    
+
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
         spec = self._gateway or find_by_model(model)
@@ -70,26 +70,30 @@ class LiteLLMProvider(LLMProvider):
             resolved = env_val.replace("{api_key}", api_key)
             resolved = resolved.replace("{api_base}", effective_base)
             os.environ.setdefault(env_name, resolved)
-    
+
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
         if self._gateway:
-            # Gateway mode: apply gateway prefix, skip provider-specific prefixes
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
                 model = model.split("/")[-1]
             if prefix and not model.startswith(f"{prefix}/"):
                 model = f"{prefix}/{model}"
             return model
-        
-        # Standard mode: auto-prefix for known providers
+
         spec = find_by_model(model)
         if spec and spec.litellm_prefix:
-            if not any(model.startswith(s) for s in spec.skip_prefixes):
-                model = f"{spec.litellm_prefix}/{model}"
-        
+            prefix = spec.litellm_prefix
+            for skip in spec.skip_prefixes:
+                if model.startswith(skip):
+                    if skip.endswith("/"):
+                        model_name = model[len(skip) :]
+                        return f"{prefix}/{model_name}"
+                    return model
+            return f"{prefix}/{model}"
+
         return model
-    
+
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
         """Apply model-specific parameter overrides from the registry."""
         model_lower = model.lower()
@@ -112,11 +116,17 @@ class LiteLLMProvider(LLMProvider):
                 if isinstance(content, str) and len(content) > 1000:
                     msg["cache_control"] = {"type": "ephemeral"}
                 break
-    
+
     def _build_kwargs(
-        self, model: str, messages: list, tools: list | None,
-        max_tokens: int, temperature: float, frequency_penalty: float,
-        stream: bool = False, thinking_budget: int = 0,
+        self,
+        model: str,
+        messages: list,
+        tools: list | None,
+        max_tokens: int,
+        temperature: float,
+        frequency_penalty: float,
+        stream: bool = False,
+        thinking_budget: int = 0,
     ) -> dict[str, Any]:
         """Build common kwargs for chat/stream_chat."""
         # Debug: Log full prompt to file
@@ -169,7 +179,7 @@ class LiteLLMProvider(LLMProvider):
             kwargs["stream_options"] = {"include_usage": True}
 
         return kwargs
-    
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -182,14 +192,14 @@ class LiteLLMProvider(LLMProvider):
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions in OpenAI format.
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -208,11 +218,15 @@ class LiteLLMProvider(LLMProvider):
             print(f"Debug log failed: {e}")
 
         kwargs = self._build_kwargs(
-            model or self.default_model, messages, tools,
-            max_tokens, temperature, frequency_penalty,
+            model or self.default_model,
+            messages,
+            tools,
+            max_tokens,
+            temperature,
+            frequency_penalty,
             thinking_budget=thinking_budget,
         )
-        
+
         try:
             response = await acompletion(**kwargs, num_retries=3)
             return self._parse_response(response)
@@ -222,7 +236,7 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
-    
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -235,33 +249,40 @@ class LiteLLMProvider(LLMProvider):
     ) -> AsyncIterator[LLMStreamChunk]:
         """Stream a chat completion, yielding chunks as they arrive."""
         kwargs = self._build_kwargs(
-            model or self.default_model, messages, tools,
-            max_tokens, temperature, frequency_penalty, stream=True,
+            model or self.default_model,
+            messages,
+            tools,
+            max_tokens,
+            temperature,
+            frequency_penalty,
+            stream=True,
             thinking_budget=thinking_budget,
         )
-        
+
         try:
             response = await acompletion(**kwargs, num_retries=3)
             async for chunk in response:
                 if not chunk.choices:
                     # Usage-only chunk (final)
                     if hasattr(chunk, "usage") and chunk.usage:
-                        yield LLMStreamChunk(usage={
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", 0),
-                        })
+                        yield LLMStreamChunk(
+                            usage={
+                                "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                                "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                                "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                            }
+                        )
                     continue
-                
+
                 delta = chunk.choices[0].delta
                 finish = chunk.choices[0].finish_reason
-                
+
                 sc = LLMStreamChunk(finish_reason=finish)
-                
+
                 # Text content
                 if hasattr(delta, "content") and delta.content:
                     sc.delta_content = delta.content
-                
+
                 # Tool call deltas
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     tc = delta.tool_calls[0]
@@ -273,7 +294,7 @@ class LiteLLMProvider(LLMProvider):
                             sc.tool_call_name = tc.function.name
                         if hasattr(tc.function, "arguments") and tc.function.arguments:
                             sc.tool_call_arguments_delta = tc.function.arguments
-                
+
                 # Usage in the final chunk
                 if hasattr(chunk, "usage") and chunk.usage:
                     sc.usage = {
@@ -281,19 +302,19 @@ class LiteLLMProvider(LLMProvider):
                         "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
                         "total_tokens": getattr(chunk.usage, "total_tokens", 0),
                     }
-                
+
                 yield sc
         except Exception as e:
             yield LLMStreamChunk(
                 delta_content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
-    
+
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
         choice = response.choices[0]
         message = choice.message
-        
+
         tool_calls = []
         if hasattr(message, "tool_calls") and message.tool_calls:
             for tc in message.tool_calls:
@@ -304,13 +325,15 @@ class LiteLLMProvider(LLMProvider):
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {"raw": args}
-                
-                tool_calls.append(ToolCallRequest(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=args,
-                ))
-        
+
+                tool_calls.append(
+                    ToolCallRequest(
+                        id=tc.id,
+                        name=tc.function.name,
+                        arguments=args,
+                    )
+                )
+
         usage = {}
         if hasattr(response, "usage") and response.usage:
             usage = {
@@ -318,9 +341,9 @@ class LiteLLMProvider(LLMProvider):
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
-        
+
         reasoning_content = getattr(message, "reasoning_content", None)
-        
+
         return LLMResponse(
             content=message.content,
             tool_calls=tool_calls,
@@ -328,8 +351,7 @@ class LiteLLMProvider(LLMProvider):
             usage=usage,
             reasoning_content=reasoning_content,
         )
-    
+
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
-
