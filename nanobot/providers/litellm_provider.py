@@ -1,19 +1,15 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import json
-import json_repair
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import litellm
 from litellm import acompletion
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, LLMStreamChunk, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
-
-
-# Standard OpenAI chat-completion message keys; extras (e.g. reasoning_content) are stripped for strict providers.
-_ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
 
 class LiteLLMProvider(LLMProvider):
@@ -59,9 +55,6 @@ class LiteLLMProvider(LLMProvider):
         spec = self._gateway or find_by_model(model)
         if not spec:
             return
-        if not spec.env_key:
-            # OAuth/provider-only specs (for example: openai_codex)
-            return
 
         # Gateway/local overrides existing env; standard provider doesn't
         if self._gateway:
@@ -92,55 +85,11 @@ class LiteLLMProvider(LLMProvider):
         # Standard mode: auto-prefix for known providers
         spec = find_by_model(model)
         if spec and spec.litellm_prefix:
-            model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
             if not any(model.startswith(s) for s in spec.skip_prefixes):
                 model = f"{spec.litellm_prefix}/{model}"
-
+        
         return model
-
-    @staticmethod
-    def _canonicalize_explicit_prefix(model: str, spec_name: str, canonical_prefix: str) -> str:
-        """Normalize explicit provider prefixes like `github-copilot/...`."""
-        if "/" not in model:
-            return model
-        prefix, remainder = model.split("/", 1)
-        if prefix.lower().replace("-", "_") != spec_name:
-            return model
-        return f"{canonical_prefix}/{remainder}"
     
-    def _supports_cache_control(self, model: str) -> bool:
-        """Return True when the provider supports cache_control on content blocks."""
-        if self._gateway is not None:
-            return self._gateway.supports_prompt_caching
-        spec = find_by_model(model)
-        return spec is not None and spec.supports_prompt_caching
-
-    def _apply_cache_control(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-        """Return copies of messages and tools with cache_control injected."""
-        new_messages = []
-        for msg in messages:
-            if msg.get("role") == "system":
-                content = msg["content"]
-                if isinstance(content, str):
-                    new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
-                else:
-                    new_content = list(content)
-                    new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
-                new_messages.append({**msg, "content": new_content})
-            else:
-                new_messages.append(msg)
-
-        new_tools = tools
-        if tools:
-            new_tools = list(tools)
-            new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
-
-        return new_messages, new_tools
-
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
         """Apply model-specific parameter overrides from the registry."""
         model_lower = model.lower()
@@ -150,19 +99,77 @@ class LiteLLMProvider(LLMProvider):
                 if pattern in model_lower:
                     kwargs.update(overrides)
                     return
-    
-    @staticmethod
-    def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Strip non-standard keys and ensure assistant messages have a content key."""
-        sanitized = []
-        for msg in messages:
-            clean = {k: v for k, v in msg.items() if k in _ALLOWED_MSG_KEYS}
-            # Strict providers require "content" even when assistant only has tool_calls
-            if clean.get("role") == "assistant" and "content" not in clean:
-                clean["content"] = None
-            sanitized.append(clean)
-        return sanitized
 
+    def _apply_prompt_caching(self, kwargs: dict[str, Any]) -> None:
+        """Add cache_control to system messages for Anthropic prompt caching."""
+        messages = kwargs.get("messages", [])
+        if not messages:
+            return
+        # Mark system message for caching (saves ~90% input tokens on long sessions)
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > 1000:
+                    msg["cache_control"] = {"type": "ephemeral"}
+                break
+    
+    def _build_kwargs(
+        self, model: str, messages: list, tools: list | None,
+        max_tokens: int, temperature: float, frequency_penalty: float,
+        stream: bool = False, thinking_budget: int = 0,
+    ) -> dict[str, Any]:
+        """Build common kwargs for chat/stream_chat."""
+        # Debug: Log full prompt to file
+        try:
+            debug_data = {
+                "model": model or self.default_model,
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            with open("/tmp/nanobot_debug_prompt.json", "w") as f:
+                json.dump(debug_data, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Debug log failed: {e}")
+
+        model = self._resolve_model(model or self.default_model)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        if frequency_penalty:
+            kwargs["frequency_penalty"] = frequency_penalty
+
+        self._apply_model_overrides(model, kwargs)
+
+        # Extended thinking (Anthropic Claude)
+        if thinking_budget and thinking_budget > 0:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+
+        # Prompt caching for Anthropic Claude models (Phase 5A)
+        if "claude" in model.lower() and messages:
+            self._apply_prompt_caching(kwargs)
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        if stream:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+
+        return kwargs
+    
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -170,6 +177,8 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
+        thinking_budget: int = 0,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -184,49 +193,99 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
-        original_model = model or self.default_model
-        model = self._resolve_model(original_model)
+        # Debug: Log full prompt to file
+        try:
+            debug_data = {
+                "model": model or self.default_model,
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            with open("/tmp/nanobot_debug_prompt.json", "w") as f:
+                json.dump(debug_data, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Debug log failed: {e}")
 
-        if self._supports_cache_control(original_model):
-            messages, tools = self._apply_cache_control(messages, tools)
-
-        # Clamp max_tokens to at least 1 — negative or zero values cause
-        # LiteLLM to reject the request with "max_tokens must be at least 1".
-        max_tokens = max(1, max_tokens)
-        
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": self._sanitize_messages(messages),
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
-        
-        # Pass api_key directly — more reliable than env vars alone
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        
-        # Pass api_base for custom endpoints
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-        
-        # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
-        
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+        kwargs = self._build_kwargs(
+            model or self.default_model, messages, tools,
+            max_tokens, temperature, frequency_penalty,
+            thinking_budget=thinking_budget,
+        )
         
         try:
-            response = await acompletion(**kwargs)
+            response = await acompletion(**kwargs, num_retries=3)
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
+                finish_reason="error",
+            )
+    
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
+        thinking_budget: int = 0,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a chat completion, yielding chunks as they arrive."""
+        kwargs = self._build_kwargs(
+            model or self.default_model, messages, tools,
+            max_tokens, temperature, frequency_penalty, stream=True,
+            thinking_budget=thinking_budget,
+        )
+        
+        try:
+            response = await acompletion(**kwargs, num_retries=3)
+            async for chunk in response:
+                if not chunk.choices:
+                    # Usage-only chunk (final)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        yield LLMStreamChunk(usage={
+                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                            "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                            "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                        })
+                    continue
+                
+                delta = chunk.choices[0].delta
+                finish = chunk.choices[0].finish_reason
+                
+                sc = LLMStreamChunk(finish_reason=finish)
+                
+                # Text content
+                if hasattr(delta, "content") and delta.content:
+                    sc.delta_content = delta.content
+                
+                # Tool call deltas
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    tc = delta.tool_calls[0]
+                    sc.tool_call_index = tc.index if hasattr(tc, "index") else 0
+                    if hasattr(tc, "id") and tc.id:
+                        sc.tool_call_id = tc.id
+                    if hasattr(tc, "function"):
+                        if hasattr(tc.function, "name") and tc.function.name:
+                            sc.tool_call_name = tc.function.name
+                        if hasattr(tc.function, "arguments") and tc.function.arguments:
+                            sc.tool_call_arguments_delta = tc.function.arguments
+                
+                # Usage in the final chunk
+                if hasattr(chunk, "usage") and chunk.usage:
+                    sc.usage = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                        "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                    }
+                
+                yield sc
+        except Exception as e:
+            yield LLMStreamChunk(
+                delta_content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
     
@@ -241,7 +300,10 @@ class LiteLLMProvider(LLMProvider):
                 # Parse arguments from JSON string if needed
                 args = tc.function.arguments
                 if isinstance(args, str):
-                    args = json_repair.loads(args)
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
                 
                 tool_calls.append(ToolCallRequest(
                     id=tc.id,
@@ -270,3 +332,4 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+

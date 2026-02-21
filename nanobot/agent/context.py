@@ -8,6 +8,10 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.code.repomap import RepoMap
+from nanobot.agent.code.folding import FoldingEngine
+from nanobot.agent.code.symbol_index import SymbolIndex
+from nanobot.struct.context_manager import ContextManager
 
 
 class ContextBuilder:
@@ -19,11 +23,18 @@ class ContextBuilder:
     """
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    PROJECT_INSTRUCTION_FILES = [
+        "CLAUDE.md", "NANOBOT.md", ".nanobot.md", "CONTRIBUTING.md",
+    ]
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self.repomap = RepoMap(workspace)
+        self.folding_engine = FoldingEngine(workspace)
+        self.symbol_index = SymbolIndex(workspace, self.repomap)
+        self.context_manager = ContextManager(workspace)
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -44,6 +55,22 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        # Project instruction files (CLAUDE.md, NANOBOT.md, etc.)
+        project_instructions = self._load_project_instructions()
+        if project_instructions:
+            parts.append(project_instructions)
+
+        # Context / World Model (Phase 5)
+        # This contains high-level project info and decisions
+        context_prompt = self.context_manager.get_context_prompt()
+        if context_prompt:
+            parts.append(context_prompt)
+        
+        # Repository Map (Code Intelligence)
+        repo_map = self.repomap.get_map()
+        if repo_map:
+            parts.append(f"# Repository Map\n\n{repo_map}")
         
         # Memory context
         memory = self.memory.get_memory_context()
@@ -51,12 +78,19 @@ class ContextBuilder:
             parts.append(f"# Memory\n\n{memory}")
         
         # Skills - progressive loading
-        # 1. Always-loaded skills: include full content
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        # 1. Active skills: include full content
+        # Combine always-loaded skills with requested skills
+        active_skills = set(self.skills.get_always_skills())
+        if skill_names:
+            active_skills.update(skill_names)
+        
+        # Default skills for Senior Coder mode (Phase 4)
+        active_skills.add("repair")
+            
+        if active_skills:
+            active_content = self.skills.load_skills_for_context(list(active_skills))
+            if active_content:
+                parts.append(f"# Active Skills\n\n{active_content}")
         
         # 2. Available skills: only show summary (agent uses read_file to load)
         skills_summary = self.skills.build_skills_summary()
@@ -73,41 +107,76 @@ Skills with available="false" need dependencies installed first - you can try in
     def _get_identity(self) -> str:
         """Get the core identity section."""
         from datetime import datetime
-        import time as _time
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        tz = _time.strftime("%Z") or "UTC"
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
         
         return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
-- Read, write, and edit files
-- Execute shell commands
+You are nanobot, a powerful AI coding assistant. You have access to tools that allow you to:
+- Read, write, and edit files (with line numbers for precision)
+- Search code with `grep` and find files with `find_files`
+- Execute shell commands to build, test, and verify
 - Search the web and fetch web pages
 - Send messages to users on chat channels
 - Spawn subagents for complex background tasks
 
 ## Current Time
-{now} ({tz})
+{now}
 
 ## Runtime
 {runtime}
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
+- Memory files: {workspace_path}/memory/MEMORY.md
+- Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+
+## Coding Methodology
+
+When asked to write or modify code, follow this workflow:
+
+### 1. Understand First
+- Use `grep` and `find_files` to explore the existing codebase
+- Use `read_file` to understand relevant files (it shows line numbers)
+- Use `list_dir` to understand project structure
+
+### 2. Plan Your Approach
+- Briefly describe what you'll change before doing it
+- Identify all files that need modification
+
+### 3. Make Changes Precisely
+- **For new files**: Use `write_file` to create them
+- **For existing files**: Use `edit_file` with exact `old_text` → `new_text` replacements
+- **NEVER** use `write_file` to overwrite large existing files — use `edit_file` instead
+- **Work incrementally**: For new large files, create the skeleton first, then add sections with `edit_file`
+
+### 4. Verify Your Work
+- After changes, use `exec` to compile/build/test:
+  - Go: `go build ./...` and `go test ./...`
+  - Python: `python -m pytest` or `python script.py`
+  - Node: `npm test` or `node script.js`
+- If there are errors, read them carefully and fix with `edit_file`
+
+### 5. Iterate Until Correct
+- Keep running build/test until everything passes
+- Don't give up after the first error — fix and retry
+
+## Tool Usage Guidelines
+- `read_file` shows line numbers — use these to identify exact edit locations
+- `grep` is your best friend for finding function definitions, imports, and usages
+- `find_files` helps locate files by name or extension in the project tree
+- `edit_file` is the precision tool — specify exact text to find and replace
+- `exec` results are truncated at 10KB — pipe to `head` or `tail` for long output
 
 IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
 
-Always be helpful, accurate, and concise. Before calling tools, briefly tell the user what you're about to do (one short sentence in the user's language).
-When remembering something important, write to {workspace_path}/memory/MEMORY.md
-To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+Always be helpful, accurate, and concise. When using tools, explain what you're doing.
+When remembering something, write to {workspace_path}/memory/MEMORY.md"""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -120,7 +189,43 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
                 parts.append(f"## {filename}\n\n{content}")
         
         return "\n\n".join(parts) if parts else ""
-    
+
+    def _load_project_instructions(self) -> str:
+        """Load project instruction files from the workspace root (not the nanobot workspace)."""
+        parts = []
+        # Check workspace parent directories for project root
+        # Also check the workspace itself
+        search_dirs = [self.workspace]
+
+        # Walk up to find project root (look for .git, package.json, etc.)
+        current = self.workspace.resolve()
+        for _ in range(5):  # Max 5 levels up
+            parent = current.parent
+            if parent == current:
+                break
+            if (parent / ".git").exists() or (parent / "package.json").exists() or (parent / "pyproject.toml").exists():
+                if parent not in search_dirs:
+                    search_dirs.append(parent)
+                break
+            current = parent
+
+        seen = set()
+        for search_dir in search_dirs:
+            for filename in self.PROJECT_INSTRUCTION_FILES:
+                file_path = search_dir / filename
+                if file_path.exists() and str(file_path) not in seen:
+                    seen.add(str(file_path))
+                    try:
+                        content = file_path.read_text(encoding="utf-8")
+                        if content.strip():
+                            parts.append(f"## {filename}\n\n{content}")
+                    except Exception:
+                        pass
+
+        if not parts:
+            return ""
+        return "# Project Instructions\n\n" + "\n\n".join(parts)
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -225,18 +330,14 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         Returns:
             Updated message list.
         """
-        msg: dict[str, Any] = {"role": "assistant"}
-
-        # Always include content — some providers (e.g. StepFun) reject
-        # assistant messages that omit the key entirely.
-        msg["content"] = content
-
+        msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
+        
         if tool_calls:
             msg["tool_calls"] = tool_calls
-
-        # Include reasoning content when provided (required by some thinking models)
+        
+        # Thinking models reject history without this
         if reasoning_content:
             msg["reasoning_content"] = reasoning_content
-
+        
         messages.append(msg)
         return messages
