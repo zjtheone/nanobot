@@ -1025,12 +1025,25 @@ class AgentLoop:
                 # Build tool_call dicts for context
                 tool_call_dicts = []
                 parsed_calls = []
+                truncated_calls = []
                 for idx in sorted(tool_calls_data.keys()):
                     tc_data = tool_calls_data[idx]
                     try:
+                        if not tc_data["args"]:
+                            logger.warning(
+                                f"Tool call '{tc_data['name']}' (id={tc_data['id']}) has empty arguments "
+                                f"- possible output token truncation or streaming issue"
+                            )
+                            truncated_calls.append(tc_data)
                         args = json.loads(tc_data["args"]) if tc_data["args"] else {}
-                    except json.JSONDecodeError:
-                        args = {"raw": tc_data["args"]}
+                    except json.JSONDecodeError as e:
+                        # Log the parse error with full context for debugging
+                        logger.warning(
+                            f"Tool call JSON decode error: name={tc_data['name']}, "
+                            f"error={e}, raw_args={tc_data['args'][:200] if tc_data['args'] else 'EMPTY'}"
+                        )
+                        truncated_calls.append(tc_data)
+                        args = {"_raw": tc_data["args"], "_parse_error": str(e)}
 
                     tool_call_dicts.append(
                         {
@@ -1040,6 +1053,28 @@ class AgentLoop:
                         }
                     )
                     parsed_calls.append((tc_data["id"], tc_data["name"], args))
+
+                # If ALL tool calls are truncated, skip execution and ask LLM to retry
+                if truncated_calls and len(truncated_calls) == len(parsed_calls):
+                    logger.warning(
+                        f"All {len(truncated_calls)} tool call(s) have empty/invalid arguments. "
+                        f"Likely output truncated by max_tokens. Asking LLM to retry."
+                    )
+                    messages = self.context.add_assistant_message(
+                        messages,
+                        collected_content or None,
+                        tool_call_dicts,
+                    )
+                    # Return error for each truncated tool call so LLM can retry
+                    for tc_data in tool_call_dicts:
+                        messages = self.context.add_tool_result(
+                            messages,
+                            tc_data["id"],
+                            tc_data["function"]["name"],
+                            "Error: tool call arguments were truncated (output too long). "
+                            "Please reduce your output text and call tools one at a time with shorter content.",
+                        )
+                    continue
 
                 messages = self.context.add_assistant_message(
                     messages,
@@ -1078,10 +1113,10 @@ class AgentLoop:
                     messages, executed_tools_stream, last_modified_file_stream
                 )
 
-        # Save to session (skip error responses to avoid polluting history)
-        final_text = "".join(final_content_parts) if final_content_parts else "Done."
+        # Save to session (skip error/empty responses to avoid polluting history)
+        final_text = "".join(final_content_parts) if final_content_parts else ""
         session.add_message("user", content)
-        if not is_error_response:
+        if final_text and not is_error_response:
             session.add_message("assistant", final_text)
         self.sessions.save(session)
 

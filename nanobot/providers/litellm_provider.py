@@ -283,17 +283,32 @@ class LiteLLMProvider(LLMProvider):
                 if hasattr(delta, "content") and delta.content:
                     sc.delta_content = delta.content
 
-                # Tool call deltas
+                # Tool call deltas — iterate ALL entries, not just [0]
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
-                    tc = delta.tool_calls[0]
-                    sc.tool_call_index = tc.index if hasattr(tc, "index") else 0
-                    if hasattr(tc, "id") and tc.id:
-                        sc.tool_call_id = tc.id
-                    if hasattr(tc, "function"):
-                        if hasattr(tc.function, "name") and tc.function.name:
-                            sc.tool_call_name = tc.function.name
-                        if hasattr(tc.function, "arguments") and tc.function.arguments:
-                            sc.tool_call_arguments_delta = tc.function.arguments
+                    for tc in delta.tool_calls:
+                        tc_chunk = LLMStreamChunk(finish_reason=finish)
+                        tc_chunk.tool_call_index = tc.index if hasattr(tc, "index") else 0
+                        if hasattr(tc, "id") and tc.id:
+                            tc_chunk.tool_call_id = tc.id
+                        if hasattr(tc, "function"):
+                            if hasattr(tc.function, "name") and tc.function.name:
+                                tc_chunk.tool_call_name = tc.function.name
+                            if hasattr(tc.function, "arguments") and tc.function.arguments:
+                                tc_chunk.tool_call_arguments_delta = tc.function.arguments
+                        # Carry text content only on the first tool call chunk
+                        if tc == delta.tool_calls[0] and hasattr(delta, "content") and delta.content:
+                            tc_chunk.delta_content = sc.delta_content
+                        yield tc_chunk
+                    # Usage in the final chunk
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        yield LLMStreamChunk(
+                            usage={
+                                "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                                "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                                "total_tokens": getattr(chunk.usage, "total_tokens", 0),
+                            }
+                        )
+                    continue
 
                 # Usage in the final chunk
                 if hasattr(chunk, "usage") and chunk.usage:
