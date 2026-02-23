@@ -503,6 +503,10 @@ def agent(
         sandbox=use_sandbox,
         permission_mode=config.agents.defaults.permission_mode,
         thinking_budget=config.agents.defaults.thinking_budget,
+        on_thinking=progress.on_thinking,
+        on_iteration=progress.on_iteration,
+        on_tool_start=progress.on_tool_start,
+        on_status=progress.on_status,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

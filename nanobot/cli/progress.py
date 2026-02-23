@@ -1,5 +1,6 @@
 """Tool execution progress display for CLI."""
 
+import sys
 import time
 
 from rich.console import Console
@@ -8,6 +9,10 @@ from rich.text import Text
 
 
 console = Console(stderr=True)
+
+# ANSI escape codes for dim italic text
+_DIM_ITALIC = "\033[2;3m"
+_RESET = "\033[0m"
 
 
 class ToolProgressDisplay:
@@ -23,9 +28,51 @@ class ToolProgressDisplay:
     def __init__(self, show_diff: bool = True):
         self._show_diff = show_diff
         self._start_times: dict[str, float] = {}
+        self._thinking_shown = False
+        self._thinking_has_content = False
+
+    def _end_thinking(self) -> None:
+        """Finish the current thinking line if any content was written."""
+        if self._thinking_has_content:
+            sys.stderr.write(f"{_RESET}\n")
+            sys.stderr.flush()
+            self._thinking_has_content = False
+
+    def on_thinking(self, content: str) -> None:
+        """Display LLM reasoning/thinking content inline (streaming-friendly)."""
+        if not self._thinking_shown:
+            console.print("  [dim italic]💭 Thinking...[/dim italic]", highlight=False)
+            self._thinking_shown = True
+        if not content:
+            return
+        # Print inline without forced newlines per chunk
+        if not self._thinking_has_content:
+            sys.stderr.write(f"  {_DIM_ITALIC}")
+            self._thinking_has_content = True
+        sys.stderr.write(content)
+        sys.stderr.flush()
+
+    def on_iteration(self, iteration: int, max_iterations: int) -> None:
+        """Display iteration progress. Skip step 1 to reduce noise."""
+        self._end_thinking()
+        self._thinking_shown = False  # Reset for new iteration
+        if iteration > 1:
+            console.print(f"\n  [dim]── Step {iteration}/{max_iterations} ──[/dim]", highlight=False)
+
+    def on_status(self, status: str) -> None:
+        """Display agent status changes."""
+        self._end_thinking()
+        labels = {
+            "thinking": "🤔 Thinking...",
+            "executing_tools": "🔧 Executing tools...",
+            "compacting_context": "📦 Compacting context...",
+        }
+        label = labels.get(status, status)
+        console.print(f"  [dim]{label}[/dim]", highlight=False)
 
     def on_tool_start(self, name: str, args: dict) -> None:
         """Display tool start with a brief description."""
+        self._end_thinking()
         self._start_times[name] = time.time()
         summary = self._summarize_args(name, args)
         console.print(f"  [dim]⚙ {name}({summary})[/dim]", highlight=False)

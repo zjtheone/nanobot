@@ -279,6 +279,10 @@ class LiteLLMProvider(LLMProvider):
 
                 sc = LLMStreamChunk(finish_reason=finish)
 
+                # Reasoning content (DeepSeek-R1, Claude extended thinking, etc.)
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                    sc.reasoning_content = delta.reasoning_content
+
                 # Text content
                 if hasattr(delta, "content") and delta.content:
                     sc.delta_content = delta.content

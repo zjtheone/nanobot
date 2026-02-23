@@ -72,6 +72,10 @@ class AgentLoop:
         permission_mode: str = "auto",
         thinking_budget: int = 0,
         mcp_servers: dict | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        on_iteration: Callable[[int, int], None] | None = None,
+        on_tool_start: Callable[[str, dict], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -95,6 +99,10 @@ class AgentLoop:
         self.auto_verify_command = auto_verify_command
         self.sandbox = sandbox
         self.thinking_budget = thinking_budget
+        self.on_thinking = on_thinking
+        self.on_iteration = on_iteration
+        self.on_tool_start = on_tool_start
+        self.on_status = on_status
 
         # MCP support (from nanobot version)
         self._mcp_servers = mcp_servers or {}
@@ -471,9 +479,23 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # Notify iteration progress
+            if self.on_iteration:
+                try:
+                    self.on_iteration(iteration, self.max_iterations)
+                except Exception:
+                    pass
+
             # Trim context if approaching window limit
             messages = self._trim_context(messages)
             messages = await self._compact_context(messages)
+
+            # Notify status: thinking
+            if self.on_status:
+                try:
+                    self.on_status("thinking")
+                except Exception:
+                    pass
 
             # Call LLM
             response = await self.provider.chat(
@@ -497,8 +519,30 @@ class AgentLoop:
                     completion=response.usage.get("completion_tokens", 0),
                 )
 
+            # Notify thinking content (non-streaming)
+            if response.reasoning_content and self.on_thinking:
+                try:
+                    self.on_thinking(response.reasoning_content)
+                except Exception:
+                    pass
+
             # Handle tool calls
             if response.has_tool_calls:
+                # Notify status: executing tools
+                if self.on_status:
+                    try:
+                        self.on_status("executing_tools")
+                    except Exception:
+                        pass
+
+                # Notify tool start for each tool
+                for tc in response.tool_calls:
+                    if self.on_tool_start:
+                        try:
+                            self.on_tool_start(tc.name, tc.arguments)
+                        except Exception:
+                            pass
+
                 # Add assistant message with tool calls
                 tool_call_dicts = [
                     {
@@ -830,6 +874,11 @@ class AgentLoop:
             return messages
 
         logger.info(f"Smart compaction triggered: {total_chars} chars > {threshold} threshold")
+        if self.on_status:
+            try:
+                self.on_status("compacting_context")
+            except Exception:
+                pass
         return await self.compactor.compact(messages, keep_recent=10)
 
     async def _auto_verify(
@@ -973,8 +1022,23 @@ class AgentLoop:
             messages = self._trim_context(messages)
             messages = await self._compact_context(messages)
 
+            # Notify iteration progress
+            if self.on_iteration:
+                try:
+                    self.on_iteration(iteration, self.max_iterations)
+                except Exception:
+                    pass
+
+            # Notify status: thinking
+            if self.on_status:
+                try:
+                    self.on_status("thinking")
+                except Exception:
+                    pass
+
             # Collect the full response via streaming
             collected_content = ""
+            collected_reasoning = ""
             tool_calls_data: dict[int, dict[str, Any]] = {}  # index -> {id, name, args}
             is_final_text = True  # Will be set to False if we see tool calls
 
@@ -991,6 +1055,15 @@ class AgentLoop:
                 if chunk.usage:
                     for k in total_usage:
                         total_usage[k] += chunk.usage.get(k, 0)
+
+                # Reasoning content — notify callback and accumulate
+                if chunk.reasoning_content:
+                    collected_reasoning += chunk.reasoning_content
+                    if self.on_thinking:
+                        try:
+                            self.on_thinking(chunk.reasoning_content)
+                        except Exception:
+                            pass
 
                 # Text content — stream it out
                 if chunk.delta_content:
@@ -1064,6 +1137,7 @@ class AgentLoop:
                         messages,
                         collected_content or None,
                         tool_call_dicts,
+                        reasoning_content=collected_reasoning or None,
                     )
                     # Return error for each truncated tool call so LLM can retry
                     for tc_data in tool_call_dicts:
@@ -1080,10 +1154,26 @@ class AgentLoop:
                     messages,
                     collected_content or None,
                     tool_call_dicts,
+                    reasoning_content=collected_reasoning or None,
                 )
 
                 # Execute each tool (with permission + parallel)
                 from nanobot.providers.base import ToolCallRequest
+
+                # Notify status: executing tools
+                if self.on_status:
+                    try:
+                        self.on_status("executing_tools")
+                    except Exception:
+                        pass
+
+                # Notify tool start for each tool
+                for tc_id, tc_name, tc_args in parsed_calls:
+                    if self.on_tool_start:
+                        try:
+                            self.on_tool_start(tc_name, tc_args)
+                        except Exception:
+                            pass
 
                 tc_objects = [
                     ToolCallRequest(id=tc_id, name=tc_name, arguments=tc_args)

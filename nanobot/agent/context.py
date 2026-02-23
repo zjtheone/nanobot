@@ -335,8 +335,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         if tool_calls:
             msg["tool_calls"] = tool_calls
         
-        # Thinking models reject history without this
-        if reasoning_content:
+        # Thinking models (DeepSeek-R1) require this field on all assistant messages
+        if reasoning_content is not None:
             msg["reasoning_content"] = reasoning_content
         
         messages.append(msg)
