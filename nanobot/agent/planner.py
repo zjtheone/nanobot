@@ -1,10 +1,20 @@
 
+import json
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
+
+
+@dataclass
+class PlanStep:
+    id: int
+    title: str
+    status: str = "pending"  # pending | in_progress | completed
+
 
 class Planner:
     """
@@ -19,6 +29,10 @@ class Planner:
         self.workspace = workspace
         self.plan_path = workspace / "implementation_plan.md"
         self._current_plan: str | None = None
+        self.steps: list[PlanStep] = []
+        self._steps_path = workspace / "implementation_plan_progress.json"
+        self._on_plan_progress: Callable[[list[PlanStep]], None] | None = None
+        self._load_steps()
 
     async def create_plan(self, user_request: str) -> str:
         """
@@ -108,3 +122,55 @@ Respond ONLY with the markdown content of the plan.
             logger.info(f"Plan saved to {self.plan_path}")
         except Exception as e:
             logger.error(f"Failed to save plan: {e}")
+
+    def parse_steps(self, plan_content: str) -> list[PlanStep]:
+        """Parse #### lines from plan into trackable steps."""
+        self.steps = []
+        step_id = 0
+        for line in plan_content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#### "):
+                step_id += 1
+                self.steps.append(PlanStep(id=step_id, title=stripped[5:].strip()))
+        self._save_steps()
+        if self._on_plan_progress:
+            self._on_plan_progress(self.steps)
+        return self.steps
+
+    def update_step(self, step_id: int, status: str) -> PlanStep | None:
+        """Update a step's status and notify callback."""
+        for step in self.steps:
+            if step.id == step_id:
+                step.status = status
+                self._save_steps()
+                if self._on_plan_progress:
+                    self._on_plan_progress(self.steps)
+                return step
+        return None
+
+    def get_progress_context(self) -> str:
+        """Format steps as context for LLM injection."""
+        if not self.steps:
+            return ""
+        icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+        lines = ["# Plan Progress"]
+        for s in self.steps:
+            lines.append(f"{icons[s.status]} {s.id}. {s.title}")
+        lines.append("\nUse update_plan_step to mark steps in_progress/completed as you work.")
+        return "\n".join(lines)
+
+    def _save_steps(self) -> None:
+        try:
+            self._steps_path.write_text(
+                json.dumps([asdict(s) for s in self.steps], indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save plan steps: {e}")
+
+    def _load_steps(self) -> None:
+        if self._steps_path.exists():
+            try:
+                data = json.loads(self._steps_path.read_text(encoding="utf-8"))
+                self.steps = [PlanStep(**s) for s in data]
+            except Exception:
+                pass

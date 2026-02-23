@@ -507,6 +507,7 @@ def agent(
         on_iteration=progress.on_iteration,
         on_tool_start=progress.on_tool_start,
         on_status=progress.on_status,
+        on_plan_progress=progress.on_plan_progress,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

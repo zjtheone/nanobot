@@ -89,6 +89,23 @@ class ToolProgressDisplay:
         err_preview = error.replace("\n", " ")[:100]
         console.print(f"  [red]✗[/red] [dim]{name}[/dim] → {err_preview}", highlight=False)
 
+    def on_plan_progress(self, steps: list) -> None:
+        """Display a live checklist of plan steps."""
+        self._end_thinking()
+        console.print()
+        console.print("  [bold]📋 Plan Progress:[/bold]", highlight=False)
+        for s in steps:
+            st = s.status if hasattr(s, "status") else s.get("status", "pending")
+            title = s.title if hasattr(s, "title") else s.get("title", "?")
+            sid = s.id if hasattr(s, "id") else s.get("id", "?")
+            if st == "completed":
+                console.print(f"  [green]✓[/green] [dim]{sid}. {title}[/dim]", highlight=False)
+            elif st == "in_progress":
+                console.print(f"  [yellow]▸[/yellow] [bold]{sid}. {title}[/bold]", highlight=False)
+            else:
+                console.print(f"  [dim]○ {sid}. {title}[/dim]", highlight=False)
+        console.print()
+
     def show_diff(self, diff_text: str) -> None:
         """Display a colored unified diff."""
         if not self._show_diff or not diff_text:

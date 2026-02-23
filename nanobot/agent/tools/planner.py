@@ -39,9 +39,50 @@ class PlanTool(Tool):
     async def execute(self, requirements: str, **kwargs: Any) -> str:
         try:
             plan = await self.planner.create_plan(requirements)
+            self.planner.parse_steps(plan)
+            n = len(self.planner.steps)
             return (
-                f"Plan created successfully at {self.planner.plan_path}.\n"
-                "Please ask the user to review 'implementation_plan.md' before proceeding."
+                f"Plan created at {self.planner.plan_path} ({n} steps).\n"
+                "Use update_plan_step to track progress as you implement."
             )
         except Exception as e:
             return f"Error creating plan: {str(e)}"
+
+
+class UpdatePlanStepTool(Tool):
+    """Tool to update plan step status."""
+
+    def __init__(self, planner: Planner):
+        self.planner = planner
+
+    @property
+    def name(self) -> str:
+        return "update_plan_step"
+
+    @property
+    def description(self) -> str:
+        return "Mark a plan step as in_progress or completed to track implementation progress."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "step_id": {
+                    "type": "integer",
+                    "description": "The step number to update.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["in_progress", "completed"],
+                    "description": "New status for the step.",
+                },
+            },
+            "required": ["step_id", "status"],
+        }
+
+    async def execute(self, step_id: int, status: str, **kwargs: Any) -> str:
+        step = self.planner.update_step(step_id, status)
+        if not step:
+            return f"Error: Step {step_id} not found."
+        return self.planner.get_progress_context()

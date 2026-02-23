@@ -76,6 +76,7 @@ class AgentLoop:
         on_iteration: Callable[[int, int], None] | None = None,
         on_tool_start: Callable[[str, dict], None] | None = None,
         on_status: Callable[[str], None] | None = None,
+        on_plan_progress: Callable[[list], None] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -103,6 +104,7 @@ class AgentLoop:
         self.on_iteration = on_iteration
         self.on_tool_start = on_tool_start
         self.on_status = on_status
+        self.on_plan_progress = on_plan_progress
 
         # MCP support (from nanobot version)
         self._mcp_servers = mcp_servers or {}
@@ -269,10 +271,18 @@ class AgentLoop:
 
         # Planning (Phase 5)
         from nanobot.agent.planner import Planner
-        from nanobot.agent.tools.planner import PlanTool
+        from nanobot.agent.tools.planner import PlanTool, UpdatePlanStepTool
 
         self.planner = Planner(self.provider, self.context, self.workspace)
         self.tools.register(PlanTool(self.planner))
+        self.tools.register(UpdatePlanStepTool(self.planner))
+
+        # Wire plan progress callback
+        if self.on_plan_progress:
+            from dataclasses import asdict
+            self.planner._on_plan_progress = lambda steps: self.on_plan_progress(
+                [asdict(s) for s in steps]
+            )
 
         # Search tools
         from nanobot.agent.tools.search import GrepTool, FindFilesTool
@@ -465,6 +475,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            plan_context=self.planner.get_progress_context(),
         )
 
         # Agent loop
@@ -1006,6 +1017,7 @@ class AgentLoop:
             media=media,
             channel=channel,
             chat_id=chat_id,
+            plan_context=self.planner.get_progress_context(),
         )
 
         iteration = 0
