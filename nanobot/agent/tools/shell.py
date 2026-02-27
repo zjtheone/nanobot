@@ -20,6 +20,7 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
         session: Any | None = None,  # DockerSession or similar
+        path_append: str = "",
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -36,6 +37,7 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.session = session
+        self.path_append = path_append
     
     @property
     def name(self) -> str:
@@ -89,12 +91,17 @@ class ExecTool(Tool):
         if guard_error:
             return guard_error
         
+        env = os.environ.copy()
+        if self.path_append:
+            env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=env,
             )
             
             try:

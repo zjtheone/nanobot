@@ -12,6 +12,9 @@ from nanobot.providers.base import LLMProvider, LLMResponse, LLMStreamChunk, Too
 from nanobot.providers.registry import find_by_model, find_gateway
 
 
+# Standard OpenAI chat-completion message keys plus reasoning_content for
+# thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
+_ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
@@ -203,7 +206,42 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
-        # Debug: Log full prompt to file
+<<<<<<< HEAD
+        original_model = model or self.default_model
+        model = self._resolve_model(original_model)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        # Clamp max_tokens to at least 1 — negative or zero values cause
+        # LiteLLM to reject the request with "max_tokens must be at least 1".
+        max_tokens = max(1, max_tokens)
+        
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        
+        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
+        self._apply_model_overrides(model, kwargs)
+        
+        # Pass api_key directly — more reliable than env vars alone
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        
+        # Pass api_base for custom endpoints
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        
+        # Pass extra headers (e.g. APP-Code for AiHubMix)
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
         try:
             debug_data = {
                 "model": model or self.default_model,
@@ -360,9 +398,15 @@ class LiteLLMProvider(LLMProvider):
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
+<<<<<<< HEAD
 
         reasoning_content = getattr(message, "reasoning_content", None)
 
+=======
+        
+        reasoning_content = getattr(message, "reasoning_content", None) or None
+        
+>>>>>>> origin/main
         return LLMResponse(
             content=message.content,
             tool_calls=tool_calls,

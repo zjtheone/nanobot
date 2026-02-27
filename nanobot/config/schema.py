@@ -1,6 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
+
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings
 
@@ -54,7 +56,28 @@ class DiscordConfig(BaseModel):
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
 
 
+<<<<<<< HEAD
 class EmailConfig(BaseModel):
+=======
+class MatrixConfig(Base):
+    """Matrix (Element) channel configuration."""
+
+    enabled: bool = False
+    homeserver: str = "https://matrix.org"
+    access_token: str = ""
+    user_id: str = ""  # @bot:matrix.org
+    device_id: str = ""
+    e2ee_enabled: bool = True # Enable Matrix E2EE support (encryption + encrypted room handling).
+    sync_stop_grace_seconds: int = 2 # Max seconds to wait for sync_forever to stop gracefully before cancellation fallback.
+    max_media_bytes: int = 20 * 1024 * 1024 # Max attachment size accepted for Matrix media handling (inbound + outbound).
+    allow_from: list[str] = Field(default_factory=list)
+    group_policy: Literal["open", "mention", "allowlist"] = "open"
+    group_allow_from: list[str] = Field(default_factory=list)
+    allow_room_mentions: bool = False
+
+
+class EmailConfig(Base):
+>>>>>>> origin/main
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
     enabled: bool = False
@@ -163,6 +186,8 @@ class QQConfig(BaseModel):
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
 
+    send_progress: bool = True    # stream agent's text progress to the channel
+    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -172,6 +197,7 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    matrix: MatrixConfig = Field(default_factory=MatrixConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -179,16 +205,18 @@ class AgentDefaults(BaseModel):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
-    temperature: float = 0.7
+    temperature: float = 0.1
     frequency_penalty: float = 0.0
-    max_tool_iterations: int = 20
+    max_tool_iterations: int = 40
     context_window: int = 200000  # chars (~50K tokens), trim old tool results when exceeded
     auto_verify: bool = True  # Auto-run build/test after code changes
     auto_verify_command: str = ""  # Custom verify command (empty = auto-detect project type)
     sandbox: bool = False  # Enable Docker sandbox for execution
     permission_mode: str = "auto"  # auto | confirm_writes | confirm_all | yolo
     thinking_budget: int = 0  # Extended thinking token budget (0 = disabled)
+    memory_window: int = 100
 
 
 class AgentsConfig(BaseModel):
@@ -222,11 +250,20 @@ class ProvidersConfig(BaseModel):
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
 
 
-class GatewayConfig(BaseModel):
+class HeartbeatConfig(Base):
+    """Heartbeat service configuration."""
+
+    enabled: bool = True
+    interval_s: int = 30 * 60  # 30 minutes
+
+
+class GatewayConfig(Base):
+    """Gateway/server configuration."""
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
 class WebSearchConfig(BaseModel):
@@ -246,10 +283,24 @@ class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
 
     timeout: int = 60
+    timeout: int = 60
     sandbox_image: str = "python:3.12-slim"
+    path_append: str = ""
 
 
-class ToolsConfig(BaseModel):
+class MCPServerConfig(Base):
+    """MCP server connection configuration (stdio or HTTP)."""
+
+    command: str = ""  # Stdio: command to run (e.g. "npx")
+    args: list[str] = Field(default_factory=list)  # Stdio: command arguments
+    env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
+    url: str = ""  # HTTP: streamable HTTP endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
+    tool_timeout: int = 30  # Seconds before a tool call is cancelled
+
+
+class ToolsConfig(Base):
+    """Tools configuration."""
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
@@ -292,6 +343,11 @@ class Config(BaseSettings):
     ) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
         from nanobot.providers.registry import PROVIDERS, find_by_name
+
+        forced = self.agents.defaults.provider
+        if forced != "auto":
+            p = getattr(self.providers, forced, None)
+            return (p, forced) if p else (None, None)
 
         model_lower = (model or self.agents.defaults.model).lower()
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""

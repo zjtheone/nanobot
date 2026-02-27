@@ -210,58 +210,46 @@ def onboard():
 
 
 def _create_workspace_templates(workspace: Path):
-    """Create default workspace template files."""
-    templates = {
-        "AGENTS.md": """# Agent Instructions
+    """Create default workspace template files from bundled templates."""
+    from importlib.resources import files as pkg_files
 
-You are a helpful AI assistant. Be concise, accurate, and friendly.
+    templates_dir = pkg_files("nanobot") / "templates"
 
-## Guidelines
-
-- Always explain what you're doing before taking actions
-- Ask for clarification when the request is ambiguous
-- Use tools to help accomplish tasks
-- Remember important information in your memory files
-""",
-        "SOUL.md": """# Soul
-
-I am nanobot, a lightweight AI assistant.
-
-## Personality
-
-- Helpful and friendly
-- Concise and to the point
-- Curious and eager to learn
-
-## Values
-
-- Accuracy over speed
-- User privacy and safety
-- Transparency in actions
-""",
-        "USER.md": """# User
-
-Information about the user goes here.
-
-## Preferences
-
-- Communication style: (casual/formal)
-- Timezone: (your timezone)
-- Language: (your preferred language)
-""",
-    }
-
-    for filename, content in templates.items():
-        file_path = workspace / filename
-        if not file_path.exists():
-            file_path.write_text(content)
-            console.print(f"  [dim]Created {filename}[/dim]")
+    for item in templates_dir.iterdir():
+        if not item.name.endswith(".md"):
+            continue
+        dest = workspace / item.name
+        if not dest.exists():
+            dest.write_text(item.read_text(encoding="utf-8"), encoding="utf-8")
+            console.print(f"  [dim]Created {item.name}[/dim]")
 
     # Create memory directory and MEMORY.md
     memory_dir = workspace / "memory"
     memory_dir.mkdir(exist_ok=True)
+
+    memory_template = templates_dir / "memory" / "MEMORY.md"
     memory_file = memory_dir / "MEMORY.md"
     if not memory_file.exists():
+        memory_file.write_text(memory_template.read_text(encoding="utf-8"), encoding="utf-8")
+        console.print("  [dim]Created memory/MEMORY.md[/dim]")
+
+    history_file = memory_dir / "HISTORY.md"
+    if not history_file.exists():
+        history_file.write_text("", encoding="utf-8")
+        console.print("  [dim]Created memory/HISTORY.md[/dim]")
+
+    (workspace / "skills").mkdir(exist_ok=True)
+
+    # Create memory directory and MEMORY.md
+=======
+>>>>>>> origin/main
+    memory_dir = workspace / "memory"
+    memory_dir.mkdir(exist_ok=True)
+
+    memory_template = templates_dir / "memory" / "MEMORY.md"
+    memory_file = memory_dir / "MEMORY.md"
+    if not memory_file.exists():
+<<<<<<< HEAD
         memory_file.write_text("""# Long-term Memory
 
 This file stores important information that should persist across sessions.
@@ -279,10 +267,17 @@ This file stores important information that should persist across sessions.
 (Things to remember)
 """)
         console.print("  [dim]Created memory/MEMORY.md[/dim]")
+=======
+        memory_file.write_text(memory_template.read_text(encoding="utf-8"), encoding="utf-8")
+        console.print("  [dim]Created memory/MEMORY.md[/dim]")
 
-    # Create skills directory for custom user skills
-    skills_dir = workspace / "skills"
-    skills_dir.mkdir(exist_ok=True)
+    history_file = memory_dir / "HISTORY.md"
+    if not history_file.exists():
+        history_file.write_text("", encoding="utf-8")
+        console.print("  [dim]Created memory/HISTORY.md[/dim]")
+>>>>>>> origin/main
+
+    (workspace / "skills").mkdir(exist_ok=True)
 
 
 def _make_provider(config):
@@ -355,9 +350,14 @@ def gateway(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+<<<<<<< HEAD
         sandbox=config.agents.defaults.sandbox,
         permission_mode=config.agents.defaults.permission_mode,
         thinking_budget=config.agents.defaults.thinking_budget,
+=======
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+>>>>>>> origin/main
     )
 
     # Set cron callback (needs agent)
@@ -382,6 +382,7 @@ def gateway(
         return response
 
     cron.on_job = on_cron_job
+<<<<<<< HEAD
 
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
@@ -398,6 +399,63 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus, session_manager=session_manager)
 
+=======
+    
+    # Create channel manager
+    channels = ChannelManager(config, bus)
+
+    def _pick_heartbeat_target() -> tuple[str, str]:
+        """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        enabled = set(channels.enabled_channels)
+        # Prefer the most recently updated non-internal session on an enabled channel.
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if ":" not in key:
+                continue
+            channel, chat_id = key.split(":", 1)
+            if channel in {"cli", "system"}:
+                continue
+            if channel in enabled and chat_id:
+                return channel, chat_id
+        # Fallback keeps prior behavior but remains explicit.
+        return "cli", "direct"
+
+    # Create heartbeat service
+    async def on_heartbeat_execute(tasks: str) -> str:
+        """Phase 2: execute heartbeat tasks through the full agent loop."""
+        channel, chat_id = _pick_heartbeat_target()
+
+        async def _silent(*_args, **_kwargs):
+            pass
+
+        return await agent.process_direct(
+            tasks,
+            session_key="heartbeat",
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=_silent,
+        )
+
+    async def on_heartbeat_notify(response: str) -> None:
+        """Deliver a heartbeat response to the user's channel."""
+        from nanobot.bus.events import OutboundMessage
+        channel, chat_id = _pick_heartbeat_target()
+        if channel == "cli":
+            return  # No external channel available to deliver to
+        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+
+    hb_cfg = config.gateway.heartbeat
+    heartbeat = HeartbeatService(
+        workspace=config.workspace_path,
+        provider=provider,
+        model=agent.model,
+        on_execute=on_heartbeat_execute,
+        on_notify=on_heartbeat_notify,
+        interval_s=hb_cfg.interval_s,
+        enabled=hb_cfg.enabled,
+    )
+    
+>>>>>>> origin/main
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -406,9 +464,15 @@ def gateway(
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+<<<<<<< HEAD
 
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
 
+=======
+    
+    console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    
+>>>>>>> origin/main
     async def run():
         try:
             await cron.start()
@@ -496,6 +560,7 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+<<<<<<< HEAD
         context_window=config.agents.defaults.context_window,
         on_tool_call=_on_tool_call,
         auto_verify=config.agents.defaults.auto_verify,
@@ -508,6 +573,10 @@ def agent(
         on_tool_start=progress.on_tool_start,
         on_status=progress.on_status,
         on_plan_progress=progress.on_plan_progress,
+=======
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+>>>>>>> origin/main
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -519,6 +588,17 @@ def agent(
         # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
 
+<<<<<<< HEAD
+=======
+    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
+        ch = agent_loop.channels_config
+        if ch and tool_hint and not ch.send_tool_hints:
+            return
+        if ch and not tool_hint and not ch.send_progress:
+            return
+        console.print(f"  [dim]↳ {content}[/dim]")
+
+>>>>>>> origin/main
     if message:
         # Single message mode
         media_paths = list(image) if image else None
@@ -561,6 +641,7 @@ def agent(
         async def run_interactive():
             nonlocal _current_task, _last_interrupt
 
+<<<<<<< HEAD
             loop = asyncio.get_event_loop()
 
             def _handle_sigint():
@@ -590,6 +671,29 @@ def agent(
                     user_input = await _read_interactive_input_async()
                     command = user_input.strip()
                     if not command:
+=======
+            async def _consume_outbound():
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                        if msg.metadata.get("_progress"):
+                            is_tool_hint = msg.metadata.get("_tool_hint", False)
+                            ch = agent_loop.channels_config
+                            if ch and is_tool_hint and not ch.send_tool_hints:
+                                pass
+                            elif ch and not is_tool_hint and not ch.send_progress:
+                                pass
+                            else:
+                                console.print(f"  [dim]↳ {msg.content}[/dim]")
+                        elif not turn_done.is_set():
+                            if msg.content:
+                                turn_response.append(msg.content)
+                            turn_done.set()
+                        elif msg.content:
+                            console.print()
+                            _print_agent_response(msg.content, render_markdown=markdown)
+                    except asyncio.TimeoutError:
+>>>>>>> origin/main
                         continue
 
                     if _is_exit_command(command):
@@ -698,6 +802,33 @@ def channels_status():
     slack = config.channels.slack
     slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
     table.add_row("Slack", "✓" if slack.enabled else "✗", slack_config)
+
+    # DingTalk
+    dt = config.channels.dingtalk
+    dt_config = f"client_id: {dt.client_id[:10]}..." if dt.client_id else "[dim]not configured[/dim]"
+    table.add_row(
+        "DingTalk",
+        "✓" if dt.enabled else "✗",
+        dt_config
+    )
+
+    # QQ
+    qq = config.channels.qq
+    qq_config = f"app_id: {qq.app_id[:10]}..." if qq.app_id else "[dim]not configured[/dim]"
+    table.add_row(
+        "QQ",
+        "✓" if qq.enabled else "✗",
+        qq_config
+    )
+
+    # Email
+    em = config.channels.email
+    em_config = em.imap_host if em.imap_host else "[dim]not configured[/dim]"
+    table.add_row(
+        "Email",
+        "✓" if em.enabled else "✗",
+        em_config
+    )
 
     console.print(table)
 
@@ -939,6 +1070,32 @@ def cron_run(
     """Manually run a job."""
     from nanobot.config.loader import get_data_dir
     from nanobot.cron.service import CronService
+<<<<<<< HEAD
+=======
+    from nanobot.cron.types import CronJob
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
+    logger.disable("nanobot")
+
+    config = load_config()
+    provider = _make_provider(config)
+    bus = MessageBus()
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+    )
+>>>>>>> origin/main
 
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)

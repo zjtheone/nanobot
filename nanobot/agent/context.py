@@ -3,6 +3,8 @@
 import base64
 import mimetypes
 import platform
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,17 +17,13 @@ from nanobot.struct.context_manager import ContextManager
 
 
 class ContextBuilder:
-    """
-    Builds the context (system prompt + messages) for the agent.
-    
-    Assembles bootstrap files, memory, skills, and conversation history
-    into a coherent prompt for the LLM.
-    """
+    """Builds the context (system prompt + messages) for the agent."""
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     PROJECT_INSTRUCTION_FILES = [
         "CLAUDE.md", "NANOBOT.md", ".nanobot.md", "CONTRIBUTING.md",
     ]
+    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -37,25 +35,13 @@ class ContextBuilder:
         self.context_manager = ContextManager(workspace)
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """
-        Build the system prompt from bootstrap files, memory, and skills.
-        
-        Args:
-            skill_names: Optional list of skills to include.
-        
-        Returns:
-            Complete system prompt.
-        """
-        parts = []
-        
-        # Core identity
-        parts.append(self._get_identity())
-        
-        # Bootstrap files
+        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        parts = [self._get_identity()]
+
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
-
+            
         # Project instruction files (CLAUDE.md, NANOBOT.md, etc.)
         project_instructions = self._load_project_instructions()
         if project_instructions:
@@ -101,7 +87,7 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
-        
+
         return "\n\n---\n\n".join(parts)
     
     def _get_identity(self) -> str:
@@ -135,8 +121,6 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## Coding Methodology
-
-When asked to write or modify code, follow this workflow:
 
 ### 1. Understand First
 - Use `grep` and `find_files` to explore the existing codebase
@@ -177,6 +161,16 @@ For normal conversation, just respond with text - do not call the message tool.
 
 Always be helpful, accurate, and concise. When using tools, explain what you're doing.
 When remembering something, write to {workspace_path}/memory/MEMORY.md"""
+    
+    @staticmethod
+    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+        """Build untrusted runtime metadata block for injection before the user message."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tz = time.strftime("%Z") or "UTC"
+        lines = [f"Current Time: {now} ({tz})"]
+        if channel and chat_id:
+            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -288,35 +282,15 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         return images + [{"type": "text", "text": text}]
     
     def add_tool_result(
-        self,
-        messages: list[dict[str, Any]],
-        tool_call_id: str,
-        tool_name: str,
-        result: str
+        self, messages: list[dict[str, Any]],
+        tool_call_id: str, tool_name: str, result: str,
     ) -> list[dict[str, Any]]:
-        """
-        Add a tool result to the message list.
-        
-        Args:
-            messages: Current message list.
-            tool_call_id: ID of the tool call.
-            tool_name: Name of the tool.
-            result: Tool execution result.
-        
-        Returns:
-            Updated message list.
-        """
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": result
-        })
+        """Add a tool result to the message list."""
+        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
         return messages
     
     def add_assistant_message(
-        self,
-        messages: list[dict[str, Any]],
+        self, messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
