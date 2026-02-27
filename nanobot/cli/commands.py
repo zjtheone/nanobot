@@ -953,6 +953,102 @@ def cron_run(
 
 
 # ============================================================================
+# Session Commands
+# ============================================================================
+
+session_app = typer.Typer(help="Manage conversation sessions")
+app.add_typer(session_app, name="session")
+
+@session_app.command("list")
+def session_list():
+    """List conversation sessions."""
+    from nanobot.config.loader import load_config
+    from nanobot.session.manager import SessionManager
+    from datetime import datetime
+
+    config = load_config()
+    session_manager = SessionManager(config.workspace_path)
+    sessions = session_manager.list_sessions()
+
+    if not sessions:
+        console.print("No sessions found.")
+        return
+
+    table = Table(title="Conversation Sessions")
+    table.add_column("Session ID", style="cyan")
+    table.add_column("Created At", style="magenta")
+    table.add_column("Updated At", style="green")
+
+    for s in sessions:
+        created = s.get("created_at", "")
+        updated = s.get("updated_at", "")
+
+        if created:
+            try:
+                created = datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+        if updated:
+            try:
+                updated = datetime.fromisoformat(updated).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+
+        table.add_row(s["key"], created, updated)
+
+    console.print(table)
+
+
+@session_app.command("show")
+def session_show(
+    session_id: str = typer.Argument(..., help="Session ID to show"),
+):
+    """Show detailed information about a specific session."""
+    from nanobot.session.manager import SessionManager
+    from nanobot.config.loader import load_config
+    from datetime import datetime
+
+    config = load_config()
+    manager = SessionManager(config.workspace_path)
+    session = manager._load(session_id)
+
+    if not session:
+        console.print(f"[red]Session {session_id} not found[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold cyan]Session Details: {session_id}[/bold cyan]")
+    console.print(f"Created At: [magenta]{session.created_at.strftime('%Y-%m-%d %H:%M:%S')}[/magenta]")
+    console.print(f"Updated At: [green]{session.updated_at.strftime('%Y-%m-%d %H:%M:%S')}[/green]")
+    console.print(f"Message Count: {len(session.messages)}")
+
+    if session.metadata:
+        console.print("\n[bold]Metadata:[/bold]")
+        for k, v in session.metadata.items():
+            console.print(f"  {k}: {v}")
+
+    if session.messages:
+        console.print("\n[bold]Last 5 Messages:[/bold]")
+        last_messages = session.messages[-5:]
+        for msg in last_messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            timestamp = msg.get("timestamp", "")
+            if timestamp:
+                try:
+                    timestamp = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+                except Exception:
+                    pass
+
+            color = "blue" if role == "user" else "green" if role == "assistant" else "yellow"
+            # Truncate content for display
+            display_content = content.strip().replace("\n", " ")
+            if len(display_content) > 150:
+                display_content = display_content[:147] + "..."
+            
+            console.print(f"[[dim]{timestamp}[/dim]] [bold {color}]{role.capitalize()}:[/bold {color}] {display_content}")
+    console.print()
+
+# ============================================================================
 # Status Commands
 # ============================================================================
 
