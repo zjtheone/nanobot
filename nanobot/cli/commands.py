@@ -531,14 +531,30 @@ def agent(
                 console.print()
                 console.print(f"[cyan]{__logo__} nanobot[/cyan]")
                 
-                async for chunk in agent_loop.process_direct_stream(
-                    message, session_id, media=media_paths
-                ):
-                    if chunk.startswith("\n\n[tokens:"):
-                        continue
-                    print(chunk, end="", flush=True)
-                    full_response.append(chunk)
-                print()
+                live = None
+                try:
+                    async for chunk in agent_loop.process_direct_stream(
+                        message, session_id, media=media_paths
+                    ):
+                        if chunk.startswith("\n\n[tokens:"):
+                            continue
+                            
+                        full_response.append(chunk)
+                        
+                        if markdown:
+                            if live is None:
+                                # Start Live only when real content begins (thinking is done)
+                                live = Live(Markdown(""), console=console, refresh_per_second=15, transient=False)
+                                live.start()
+                            live.update(Markdown("".join(full_response)))
+                        else:
+                            print(chunk, end="", flush=True)
+                            
+                    if not markdown and full_response:
+                        print()
+                finally:
+                    if live is not None:
+                        live.stop()
 
             asyncio.run(run_once_stream())
         else:
@@ -606,14 +622,30 @@ def agent(
                             full_response = []
                             console.print()
                             console.print(f"[cyan]{__logo__} nanobot[/cyan]")
-                            async for chunk in agent_loop.process_direct_stream(
-                                user_input, session_id
-                            ):
-                                if chunk.startswith("\n\n[tokens:"):
-                                    continue
-                                print(chunk, end="", flush=True)
-                                full_response.append(chunk)
-                            print()
+                            live = None
+                            try:
+                                async for chunk in agent_loop.process_direct_stream(
+                                    user_input, session_id
+                                ):
+                                    if chunk.startswith("\n\n[tokens:"):
+                                        continue
+                                        
+                                    full_response.append(chunk)
+                                    
+                                    if markdown:
+                                        if live is None:
+                                            # Start Live only when real content begins (thinking is done)
+                                            live = Live(Markdown(""), console=console, refresh_per_second=15, transient=False)
+                                            live.start()
+                                        live.update(Markdown("".join(full_response)))
+                                    else:
+                                        print(chunk, end="", flush=True)
+                                        
+                                if not markdown and full_response:
+                                    print()
+                            finally:
+                                if live is not None:
+                                    live.stop()
 
                         _current_task = asyncio.create_task(_stream_task())
                         try:
