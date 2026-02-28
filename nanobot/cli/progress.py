@@ -45,11 +45,22 @@ class ToolProgressDisplay:
             self._thinking_shown = True
         if not content:
             return
-        # Print inline without forced newlines per chunk
+            
+        # Initialize the ANSI sequence for this block
         if not self._thinking_has_content:
             sys.stderr.write(f"  {_DIM_ITALIC}")
             self._thinking_has_content = True
-        sys.stderr.write(content)
+            
+        # For multi-line chunks, we must ensure every new line starts with the correct indentation
+        # and re-applies the dim italic style, because terminal carriage returns often reset styles.
+        parts = content.split('\n')
+        for i, part in enumerate(parts):
+            if i > 0:
+                # This is a newline. We end the current line, print the actual newline, 
+                # and start the next line with our prefix and styling.
+                sys.stderr.write(f"{_RESET}\n  {_DIM_ITALIC}")
+            sys.stderr.write(part)
+            
         sys.stderr.flush()
 
     def on_iteration(self, iteration: int, max_iterations: int) -> None:
