@@ -34,8 +34,7 @@ class ToolProgressDisplay:
     def _end_thinking(self) -> None:
         """Finish the current thinking line if any content was written."""
         if self._thinking_has_content:
-            sys.stderr.write(f"{_RESET}\n")
-            sys.stderr.flush()
+            console.print()  # Add final newline
             self._thinking_has_content = False
 
     def on_thinking(self, content: str) -> None:
@@ -46,23 +45,18 @@ class ToolProgressDisplay:
         if not content:
             return
             
-        # Initialize the ANSI sequence for this block
         if not self._thinking_has_content:
-            sys.stderr.write(f"  {_DIM_ITALIC}")
+            content = "  " + content
             self._thinking_has_content = True
+        else:
+            # If the previous chunk ended in a newline, the next chunk needs indentation
+            pass  # Handled by replacing newlines with newline + spaces
             
-        # For multi-line chunks, we must ensure every new line starts with the correct indentation
-        # and re-applies the dim italic style, because terminal carriage returns often reset styles.
-        parts = content.split('\n')
-        for i, part in enumerate(parts):
-            if i > 0:
-                # This is a newline. We end the current line, print the actual newline, 
-                # and start the next line with our prefix and styling.
-                sys.stderr.write(f"{_RESET}\n  {_DIM_ITALIC}")
-            sys.stderr.write(part)
+        if "\n" in content:
+            content = content.replace("\n", "\n  ")
             
-        sys.stderr.flush()
-
+        # Print using rich to safely handle styles without exposing ANSI escapes
+        console.print(Text(content, style="dim italic"), end="", highlight=False)
     def on_iteration(self, iteration: int, max_iterations: int) -> None:
         """Display iteration progress. Skip step 1 to reduce noise."""
         self._end_thinking()
