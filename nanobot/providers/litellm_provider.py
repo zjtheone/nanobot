@@ -1,32 +1,34 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import json
+import json_repair
 import os
-from collections.abc import AsyncIterator
 from typing import Any
 
 import litellm
 from litellm import acompletion
 
-from nanobot.providers.base import LLMProvider, LLMResponse, LLMStreamChunk, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
 
 # Standard OpenAI chat-completion message keys plus reasoning_content for
 # thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
+
+
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
-
+    
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
     """
-
+    
     def __init__(
-        self,
-        api_key: str | None = None,
+        self, 
+        api_key: str | None = None, 
         api_base: str | None = None,
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
@@ -35,28 +37,31 @@ class LiteLLMProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
-
+        
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
         # api_key / api_base are fallback for auto-detection.
         self._gateway = find_gateway(provider_name, api_key, api_base)
-
+        
         # Configure environment variables
         if api_key:
             self._setup_env(api_key, api_base, default_model)
-
+        
         if api_base:
             litellm.api_base = api_base
-
+        
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
-
+    
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
         spec = self._gateway or find_by_model(model)
         if not spec:
+            return
+        if not spec.env_key:
+            # OAuth/provider-only specs (for example: openai_codex)
             return
 
         # Gateway/local overrides existing env; standard provider doesn't
@@ -73,29 +78,69 @@ class LiteLLMProvider(LLMProvider):
             resolved = env_val.replace("{api_key}", api_key)
             resolved = resolved.replace("{api_base}", effective_base)
             os.environ.setdefault(env_name, resolved)
-
+    
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
         if self._gateway:
+            # Gateway mode: apply gateway prefix, skip provider-specific prefixes
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
                 model = model.split("/")[-1]
             if prefix and not model.startswith(f"{prefix}/"):
                 model = f"{prefix}/{model}"
             return model
-
+        
+        # Standard mode: auto-prefix for known providers
         spec = find_by_model(model)
         if spec and spec.litellm_prefix:
-            prefix = spec.litellm_prefix
-            for skip in spec.skip_prefixes:
-                if model.startswith(skip):
-                    if skip.endswith("/"):
-                        model_name = model[len(skip) :]
-                        return f"{prefix}/{model_name}"
-                    return model
-            return f"{prefix}/{model}"
+            model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
+            if not any(model.startswith(s) for s in spec.skip_prefixes):
+                model = f"{spec.litellm_prefix}/{model}"
 
         return model
+
+    @staticmethod
+    def _canonicalize_explicit_prefix(model: str, spec_name: str, canonical_prefix: str) -> str:
+        """Normalize explicit provider prefixes like `github-copilot/...`."""
+        if "/" not in model:
+            return model
+        prefix, remainder = model.split("/", 1)
+        if prefix.lower().replace("-", "_") != spec_name:
+            return model
+        return f"{canonical_prefix}/{remainder}"
+    
+    def _supports_cache_control(self, model: str) -> bool:
+        """Return True when the provider supports cache_control on content blocks."""
+        if self._gateway is not None:
+            return self._gateway.supports_prompt_caching
+        spec = find_by_model(model)
+        return spec is not None and spec.supports_prompt_caching
+
+    def _apply_cache_control(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+        """Return copies of messages and tools with cache_control injected."""
+        new_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg["content"]
+                if isinstance(content, str):
+                    new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                else:
+                    new_content = list(content)
+                    new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
+                new_messages.append({**msg, "content": new_content})
+            else:
+                new_messages.append(msg)
+
+        new_tools = tools
+        if tools:
+            new_tools = list(tools)
+            new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
+
+        return new_messages, new_tools
 
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
         """Apply model-specific parameter overrides from the registry."""
@@ -106,82 +151,18 @@ class LiteLLMProvider(LLMProvider):
                 if pattern in model_lower:
                     kwargs.update(overrides)
                     return
-
-    def _apply_prompt_caching(self, kwargs: dict[str, Any]) -> None:
-        """Add cache_control to system messages for Anthropic prompt caching."""
-        messages = kwargs.get("messages", [])
-        if not messages:
-            return
-        # Mark system message for caching (saves ~90% input tokens on long sessions)
+    
+    @staticmethod
+    def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip non-standard keys and ensure assistant messages have a content key."""
+        sanitized = []
         for msg in messages:
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 1000:
-                    msg["cache_control"] = {"type": "ephemeral"}
-                break
-
-    def _build_kwargs(
-        self,
-        model: str,
-        messages: list,
-        tools: list | None,
-        max_tokens: int,
-        temperature: float,
-        frequency_penalty: float,
-        stream: bool = False,
-        thinking_budget: int = 0,
-    ) -> dict[str, Any]:
-        """Build common kwargs for chat/stream_chat."""
-        # Debug: Log full prompt to file
-        try:
-            debug_data = {
-                "model": model or self.default_model,
-                "messages": messages,
-                "tools": tools,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
-            with open("/tmp/nanobot_debug_prompt.json", "w") as f:
-                json.dump(debug_data, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Debug log failed: {e}")
-
-        model = self._resolve_model(model or self.default_model)
-
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-
-        if frequency_penalty:
-            kwargs["frequency_penalty"] = frequency_penalty
-
-        self._apply_model_overrides(model, kwargs)
-
-        # Extended thinking (Anthropic Claude)
-        if thinking_budget and thinking_budget > 0:
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
-
-        # Prompt caching for Anthropic Claude models (Phase 5A)
-        if "claude" in model.lower() and messages:
-            self._apply_prompt_caching(kwargs)
-
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        if stream:
-            kwargs["stream"] = True
-            kwargs["stream_options"] = {"include_usage": True}
-
-        return kwargs
+            clean = {k: v for k, v in msg.items() if k in _ALLOWED_MSG_KEYS}
+            # Strict providers require "content" even when assistant only has tool_calls
+            if clean.get("role") == "assistant" and "content" not in clean:
+                clean["content"] = None
+            sanitized.append(clean)
+        return sanitized
 
     async def chat(
         self,
@@ -190,23 +171,20 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        frequency_penalty: float = 0.0,
-        thinking_budget: int = 0,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
-
+        
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions in OpenAI format.
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
-
+        
         Returns:
             LLMResponse with content and/or tool calls.
         """
-<<<<<<< HEAD
         original_model = model or self.default_model
         model = self._resolve_model(original_model)
 
@@ -242,31 +220,9 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        
         try:
-            debug_data = {
-                "model": model or self.default_model,
-                "messages": messages,
-                "tools": tools,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
-            with open("/tmp/nanobot_debug_prompt.json", "w") as f:
-                json.dump(debug_data, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Debug log failed: {e}")
-
-        kwargs = self._build_kwargs(
-            model or self.default_model,
-            messages,
-            tools,
-            max_tokens,
-            temperature,
-            frequency_penalty,
-            thinking_budget=thinking_budget,
-        )
-
-        try:
-            response = await acompletion(**kwargs, num_retries=3)
+            response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling
@@ -274,123 +230,26 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
-
-    async def stream_chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        frequency_penalty: float = 0.0,
-        thinking_budget: int = 0,
-    ) -> AsyncIterator[LLMStreamChunk]:
-        """Stream a chat completion, yielding chunks as they arrive."""
-        kwargs = self._build_kwargs(
-            model or self.default_model,
-            messages,
-            tools,
-            max_tokens,
-            temperature,
-            frequency_penalty,
-            stream=True,
-            thinking_budget=thinking_budget,
-        )
-
-        try:
-            response = await acompletion(**kwargs, num_retries=3)
-            async for chunk in response:
-                if not chunk.choices:
-                    # Usage-only chunk (final)
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        yield LLMStreamChunk(
-                            usage={
-                                "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
-                                "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
-                                "total_tokens": getattr(chunk.usage, "total_tokens", 0),
-                            }
-                        )
-                    continue
-
-                delta = chunk.choices[0].delta
-                finish = chunk.choices[0].finish_reason
-
-                sc = LLMStreamChunk(finish_reason=finish)
-
-                # Reasoning content (DeepSeek-R1, Claude extended thinking, etc.)
-                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                    sc.reasoning_content = delta.reasoning_content
-
-                # Text content
-                if hasattr(delta, "content") and delta.content:
-                    sc.delta_content = delta.content
-
-                # Tool call deltas — iterate ALL entries, not just [0]
-                if hasattr(delta, "tool_calls") and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        tc_chunk = LLMStreamChunk(finish_reason=finish)
-                        tc_chunk.tool_call_index = tc.index if hasattr(tc, "index") else 0
-                        if hasattr(tc, "id") and tc.id:
-                            tc_chunk.tool_call_id = tc.id
-                        if hasattr(tc, "function"):
-                            if hasattr(tc.function, "name") and tc.function.name:
-                                tc_chunk.tool_call_name = tc.function.name
-                            if hasattr(tc.function, "arguments") and tc.function.arguments:
-                                tc_chunk.tool_call_arguments_delta = tc.function.arguments
-                        # Carry text content only on the first tool call chunk
-                        if tc == delta.tool_calls[0] and hasattr(delta, "content") and delta.content:
-                            tc_chunk.delta_content = sc.delta_content
-                        yield tc_chunk
-                    # Usage in the final chunk
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        yield LLMStreamChunk(
-                            usage={
-                                "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
-                                "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
-                                "total_tokens": getattr(chunk.usage, "total_tokens", 0),
-                            }
-                        )
-                    continue
-
-                # Usage in the final chunk
-                if hasattr(chunk, "usage") and chunk.usage:
-                    sc.usage = {
-                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
-                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0),
-                        "total_tokens": getattr(chunk.usage, "total_tokens", 0),
-                    }
-
-                yield sc
-        except Exception as e:
-            yield LLMStreamChunk(
-                delta_content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
-
+    
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
         choice = response.choices[0]
         message = choice.message
-
+        
         tool_calls = []
         if hasattr(message, "tool_calls") and message.tool_calls:
             for tc in message.tool_calls:
                 # Parse arguments from JSON string if needed
                 args = tc.function.arguments
                 if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"raw": args}
-
-                tool_calls.append(
-                    ToolCallRequest(
-                        id=tc.id,
-                        name=tc.function.name,
-                        arguments=args,
-                    )
-                )
-
+                    args = json_repair.loads(args)
+                
+                tool_calls.append(ToolCallRequest(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=args,
+                ))
+        
         usage = {}
         if hasattr(response, "usage") and response.usage:
             usage = {
@@ -398,15 +257,9 @@ class LiteLLMProvider(LLMProvider):
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
-<<<<<<< HEAD
-
-        reasoning_content = getattr(message, "reasoning_content", None)
-
-=======
         
         reasoning_content = getattr(message, "reasoning_content", None) or None
         
->>>>>>> origin/main
         return LLMResponse(
             content=message.content,
             tool_calls=tool_calls,
@@ -414,7 +267,7 @@ class LiteLLMProvider(LLMProvider):
             usage=usage,
             reasoning_content=reasoning_content,
         )
-
+    
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model

@@ -56,10 +56,7 @@ class DiscordConfig(BaseModel):
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
 
 
-<<<<<<< HEAD
-class EmailConfig(BaseModel):
-=======
-class MatrixConfig(Base):
+class MatrixConfig(BaseModel):
     """Matrix (Element) channel configuration."""
 
     enabled: bool = False
@@ -76,8 +73,7 @@ class MatrixConfig(Base):
     allow_room_mentions: bool = False
 
 
-class EmailConfig(Base):
->>>>>>> origin/main
+class EmailConfig(BaseModel):
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
     enabled: bool = False
@@ -250,15 +246,14 @@ class ProvidersConfig(BaseModel):
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
 
 
-class HeartbeatConfig(Base):
+class HeartbeatConfig(BaseModel):
     """Heartbeat service configuration."""
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
 
 
-class GatewayConfig(Base):
-    """Gateway/server configuration."""
+class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
@@ -283,12 +278,11 @@ class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
 
     timeout: int = 60
-    timeout: int = 60
     sandbox_image: str = "python:3.12-slim"
     path_append: str = ""
 
 
-class MCPServerConfig(Base):
+class MCPServerConfig(BaseModel):
     """MCP server connection configuration (stdio or HTTP)."""
 
     command: str = ""  # Stdio: command to run (e.g. "npx")
@@ -299,23 +293,27 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
 
 
-class ToolsConfig(Base):
-    """Tools configuration."""
+class ToolsConfig(BaseModel):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
-
-
+    mcp_servers: dict[str, MCPServerConfig] = Field(
+        default_factory=dict,
+        alias="mcpServers",
+        description="MCP server configurations (stdio or HTTP)"
+    )
 class MCPServerConfig(BaseModel):
-    """Configuration for a single MCP server."""
+    """MCP server connection configuration (stdio or HTTP)."""
 
-    command: str = ""
-    args: list[str] = Field(default_factory=list)
-    env: dict[str, str] = Field(default_factory=dict)
+    command: str = ""  # Stdio: command to run (e.g. "npx")
+    args: list[str] = Field(default_factory=list)  # Stdio: command arguments
+    env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
+    url: str = ""  # HTTP: streamable HTTP endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
+    tool_timeout: int = 30  # Seconds before a tool call is cancelled
     enabled: bool = True
-
 
 class MCPConfig(BaseModel):
     """MCP (Model Context Protocol) configuration."""

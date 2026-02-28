@@ -66,4 +66,30 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+    
+    # Handle MCP config migration:
+    # - If tools.mcpServers exists, ensure it's in tools.mcpServers
+    # - If mcp.servers exists, copy to tools.mcpServers for compatibility
+    # - If tools.mcpServers (snake_case) exists, it's handled by pydantic alias
+    
+    # Ensure both config paths have MCP config for compatibility
+    mcp_servers = tools.get("mcpServers", tools.get("mcp_servers"))
+    if mcp_servers:
+        tools["mcpServers"] = mcp_servers
+    
+    top_mcp = data.get("mcp", {})
+    if top_mcp and isinstance(top_mcp, dict):
+        top_mcp_servers = top_mcp.get("servers")
+        if top_mcp_servers and ("mcpServers" not in tools and "mcp_servers" not in tools):
+            tools["mcpServers"] = top_mcp_servers
+    
+    data["tools"] = tools
+    
+    return data
+    """Migrate old config formats to current."""
+    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
+    tools = data.get("tools", {})
+    exec_cfg = tools.get("exec", {})
+    if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
+        tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
     return data
