@@ -531,23 +531,14 @@ def agent(
                 console.print()
                 console.print(f"[cyan]{__logo__} nanobot[/cyan]")
                 
-                if markdown:
-                    with Live(Markdown(""), console=console, refresh_per_second=15, transient=False) as live:
-                        async for chunk in agent_loop.process_direct_stream(
-                            message, session_id, media=media_paths
-                        ):
-                            if chunk.startswith("\n\n[tokens:"):
-                                continue  # handled by metrics/progress
-                            full_response.append(chunk)
-                            live.update(Markdown("".join(full_response)))
-                else:
-                    async for chunk in agent_loop.process_direct_stream(
-                        message, session_id, media=media_paths
-                    ):
-                        if chunk.startswith("\n\n[tokens:"):
-                            continue
-                        print(chunk, end="", flush=True)
-                    print()
+                async for chunk in agent_loop.process_direct_stream(
+                    message, session_id, media=media_paths
+                ):
+                    if chunk.startswith("\n\n[tokens:"):
+                        continue
+                    print(chunk, end="", flush=True)
+                    full_response.append(chunk)
+                print()
 
             asyncio.run(run_once_stream())
         else:
@@ -615,23 +606,14 @@ def agent(
                             full_response = []
                             console.print()
                             console.print(f"[cyan]{__logo__} nanobot[/cyan]")
-                            if markdown:
-                                with Live(Markdown(""), console=console, refresh_per_second=15, transient=False) as live:
-                                    async for chunk in agent_loop.process_direct_stream(
-                                        user_input, session_id
-                                    ):
-                                        if chunk.startswith("\n\n[tokens:"):
-                                            continue
-                                        full_response.append(chunk)
-                                        live.update(Markdown("".join(full_response)))
-                            else:
-                                async for chunk in agent_loop.process_direct_stream(
-                                    user_input, session_id
-                                ):
-                                    if chunk.startswith("\n\n[tokens:"):
-                                        continue
-                                    print(chunk, end="", flush=True)
-                                print()
+                            async for chunk in agent_loop.process_direct_stream(
+                                user_input, session_id
+                            ):
+                                if chunk.startswith("\n\n[tokens:"):
+                                    continue
+                                print(chunk, end="", flush=True)
+                                full_response.append(chunk)
+                            print()
 
                         _current_task = asyncio.create_task(_stream_task())
                         try:
