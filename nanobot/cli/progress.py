@@ -63,7 +63,7 @@ class ToolProgressDisplay:
         """Display agent status changes."""
         self._end_thinking()
         labels = {
-            "thinking": "🤔 Thinking...",
+            "thinking": "🤖 Analyzing...",
             "executing_tools": "🔧 Executing tools...",
             "compacting_context": "📦 Compacting context...",
         }
