@@ -596,7 +596,7 @@ class AgentLoop:
                         last_modified_file = tool_call.arguments.get("path", "")
 
                 # Auto-verify after file modifications
-                messages = await self._auto_verify(messages, executed_tools, last_modified_file)
+                messages, _has_errors = await self._auto_verify(messages, executed_tools, last_modified_file)
             else:
                 # No tool calls, we're done
                 final_content = response.content
@@ -897,7 +897,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         executed_tools: list[str],
         last_modified_file: str = "",
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """
         Run auto-verification after file modifications.
 
@@ -905,18 +905,18 @@ class AgentLoop:
         Injects the result as a system message so the LLM can see errors.
         """
         if not self.auto_verify:
-            return messages
+            return messages, False
 
         from nanobot.agent.verify import should_verify, get_verify_command
 
         if not should_verify(executed_tools):
-            return messages
+            return messages, False
 
         verify_cmd = get_verify_command(
             self.workspace, self.auto_verify_command, last_modified_file
         )
         if not verify_cmd:
-            return messages
+            return messages, False
 
         logger.info(f"Auto-verify: running '{verify_cmd}'")
 
@@ -942,10 +942,17 @@ class AgentLoop:
 
         # Inject verification result as a system message
         verify_msg = f"[Auto-verification] `{verify_cmd}`:\n{result}"
+        
+        # Check if there are errors (heuristic)
+        has_errors = any(w in result.lower() for w in ['error:', 'failed', 'traceback', 'exception'])
+        
+        if has_errors:
+            verify_msg += "\n\n[SYSTEM CRITICAL] The verification FAILED. You MUST use tools to fix these errors before returning a final answer to the user. Do not stop until it passes."
+            
         messages.append({"role": "user", "content": verify_msg})
         logger.info(f"Auto-verify result: {result_preview}")
 
-        return messages
+        return messages, has_errors
 
     async def process_direct(
         self,
@@ -1211,7 +1218,7 @@ class AgentLoop:
                         last_modified_file_stream = tc_args.get("path", "")
 
                 # Auto-verify after file modifications
-                messages = await self._auto_verify(
+                messages, _has_errors = await self._auto_verify(
                     messages, executed_tools_stream, last_modified_file_stream
                 )
 

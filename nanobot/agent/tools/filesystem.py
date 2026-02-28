@@ -1,5 +1,5 @@
 """File system tools: read, write, edit."""
-
+import re
 import difflib
 from pathlib import Path
 from typing import Any
@@ -141,7 +141,7 @@ class WriteFileTool(Tool):
 
 
 class EditFileTool(Tool):
-    """Tool to edit a file by replacing text."""
+    """Tool to edit a file using Aider-style SEARCH/REPLACE blocks."""
 
     def __init__(self, allowed_dir: Path | None = None, checkpoint: "CheckpointManager | None" = None):
         self._allowed_dir = allowed_dir
@@ -154,9 +154,14 @@ class EditFileTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file. "
-            "If old_text appears multiple times, provide start_line to disambiguate. "
-            "Returns a unified diff showing the change."
+            "Edit a file using Aider-style SEARCH/REPLACE blocks. "
+            "You MUST format the 'blocks' parameter exactly like this:\n"
+            "<<<<<<< SEARCH\n"
+            "exact lines to find from the original file\n"
+            "=======\n"
+            "new lines to replace them with\n"
+            ">>>>>>> REPLACE\n"
+            "Include enough context lines in the SEARCH block to uniquely identify the location."
         )
 
     @property
@@ -168,25 +173,15 @@ class EditFileTool(Tool):
                     "type": "string",
                     "description": "The file path to edit",
                 },
-                "old_text": {
+                "blocks": {
                     "type": "string",
-                    "description": "The exact text to find and replace",
-                },
-                "new_text": {
-                    "type": "string",
-                    "description": "The text to replace with",
-                },
-                "start_line": {
-                    "type": "integer",
-                    "description": "Line number hint to disambiguate when old_text appears multiple times (1-indexed)",
+                    "description": "The SEARCH/REPLACE block(s)",
                 },
             },
-            "required": ["path", "old_text", "new_text"],
+            "required": ["path", "blocks"],
         }
 
-    async def execute(
-        self, path: str, old_text: str, new_text: str, start_line: int = 0, **kwargs: Any
-    ) -> str:
+    async def execute(self, path: str, blocks: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._allowed_dir)
             if not file_path.exists():
@@ -195,34 +190,70 @@ class EditFileTool(Tool):
             content = file_path.read_text(encoding="utf-8")
             old_lines = content.splitlines(keepends=True)
 
-            if old_text not in content:
-                return "Error: old_text not found in file. Make sure it matches exactly."
+            pattern = re.compile(
+                r"<<<<<<< SEARCH\n(?P<search>.*?)\n=======\n(?P<replace>.*?)\n>>>>>>> REPLACE",
+                re.DOTALL | re.MULTILINE
+            )
+            
+            matches = pattern.finditer(blocks)
+            new_content = content
+            applied_count = 0
+            
+            for match in matches:
+                search = match.group("search")
+                replace = match.group("replace")
+                
+                # Normalize line endings for the search
+                search_normalized = search.replace('\r\n', '\n')
+                new_content_normalized = new_content.replace('\r\n', '\n')
+                
+                # Try exact match first
+                if search_normalized in new_content_normalized:
+                    new_content = new_content_normalized.replace(search_normalized, replace.replace('\n', '\n'), 1)
+                    applied_count += 1
+                    continue
+                    
+                # Aider-style flexible whitespace match
+                def get_indent(s):
+                    lines = [l for l in s.splitlines() if l.strip()]
+                    return min(len(l) - len(l.lstrip()) for l in lines) if lines else 0
 
-            count = content.count(old_text)
+                s_indent = get_indent(search_normalized)
+                r_indent = get_indent(replace.replace('\r\n', '\n'))
+                
+                # Outdent both to find the "core" match
+                s_core_lines = [l[s_indent:] if l.strip() else l for l in search_normalized.splitlines()]
+                r_core_lines = [l[r_indent:] if l.strip() else l for l in replace.replace('\r\n', '\n').splitlines()]
+                
+                # Search file line by line for the core lines
+                file_lines = new_content_normalized.splitlines(keepends=True)
+                file_lines_stripped = [l.lstrip() for l in file_lines]
+                s_core_stripped = [l.lstrip() for l in s_core_lines]
+                
+                part_len = len(s_core_stripped)
+                match_found = False
+                
+                for i in range(len(file_lines_stripped) - part_len + 1):
+                    # Compare non-empty lines, ignoring leading whitespace
+                    if [l for l in file_lines_stripped[i : i + part_len] if l.strip()] == [l for l in s_core_stripped if l.strip()]:
+                        # Re-indent the replace block to match the original file's indentation
+                        original_indent = len(file_lines[i]) - len(file_lines[i].lstrip())
+                        
+                        # Add original indentation to the core replace lines
+                        indented_replace_lines = [(" " * original_indent) + l if l.strip() else "\n" for l in r_core_lines]
+                        indented_replace = "".join(l if l.endswith("\n") else l + "\n" for l in indented_replace_lines)
+                        
+                        # Apply the patch
+                        new_content = "".join(file_lines[:i]) + indented_replace + "".join(file_lines[i + part_len:])
+                        applied_count += 1
+                        match_found = True
+                        break
+                        
+                if not match_found:
+                    return f"Error: The following SEARCH block was not found in the file (even with flexible whitespace matching):\n{search_normalized}"
 
-            if count > 1 and start_line > 0:
-                # Use start_line to pick the right occurrence
-                target_idx = start_line - 1  # 0-indexed
-                search_from = 0
-                for line_no, line in enumerate(old_lines):
-                    pos = content.find(old_text, search_from)
-                    if pos == -1:
-                        break
-                    # Check if this occurrence starts at or after the target line
-                    line_start = sum(len(l) for l in old_lines[:line_no])
-                    if pos >= line_start and line_no >= target_idx:
-                        new_content = content[:pos] + new_text + content[pos + len(old_text):]
-                        break
-                    search_from = pos + 1
-                else:
-                    new_content = content.replace(old_text, new_text, 1)
-            elif count > 1:
-                return (
-                    f"Warning: old_text appears {count} times. "
-                    "Provide start_line to specify which occurrence to replace."
-                )
-            else:
-                new_content = content.replace(old_text, new_text, 1)
+            if applied_count == 0:
+                return "Error: No valid SEARCH/REPLACE blocks found in 'blocks' parameter."
 
             # Snapshot before writing
             if self._checkpoint:
@@ -240,12 +271,12 @@ class EditFileTool(Tool):
             diff_text = "".join(diff)
 
             if diff_text:
-                return f"Successfully edited {path}\n\n{diff_text}"
-            return f"Successfully edited {path} (no visible diff)"
+                return f"Successfully applied {applied_count} edit block(s) to {path}\n\n{diff_text}"
+            return f"Successfully applied {applied_count} edit block(s) to {path} (no visible diff)"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
-            return f"Error editing file: {str(e)}"
+            return f"Error reading/writing file: {e}"
 
 
 class ListDirTool(Tool):
