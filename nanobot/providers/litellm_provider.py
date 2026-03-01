@@ -73,6 +73,16 @@ class LiteLLMProvider(LLMProvider):
 
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
+        # Auto-upgrade deprecated Google models (use flash for free tier compatibility)
+        if model == "gemini-pro" or model == "gemini-1.5-pro":
+            model = "gemini-2.5-flash"
+        elif model == "gemini/gemini-pro" or model == "gemini/gemini-1.5-pro":
+            model = "gemini/gemini-2.5-flash"
+        elif model == "gemini-flash" or model == "gemini-1.5-flash":
+            model = "gemini-2.5-flash"
+        elif model == "gemini/gemini-flash" or model == "gemini/gemini-1.5-flash":
+            model = "gemini/gemini-2.5-flash"
+
         if self._gateway:
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
@@ -152,7 +162,7 @@ class LiteLLMProvider(LLMProvider):
             "temperature": temperature,
         }
 
-        if frequency_penalty:
+        if frequency_penalty and "gemini" not in model.lower():
             kwargs["frequency_penalty"] = frequency_penalty
 
         self._apply_model_overrides(model, kwargs)

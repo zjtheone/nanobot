@@ -17,7 +17,11 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     "gpt-3.5": (0.5, 1.5),
     "deepseek": (0.27, 1.10),
     "gemini-pro": (1.25, 5.0),
+    "gemini-1.5-pro": (1.25, 5.0),
+    "gemini-2.5-pro": (1.25, 5.0),
     "gemini-flash": (0.075, 0.30),
+    "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-2.5-flash": (0.075, 0.30),
     "qwen": (0.5, 2.0),
 }
 
