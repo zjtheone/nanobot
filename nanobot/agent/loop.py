@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, Dict
 
 import json_repair
 from loguru import logger
@@ -71,6 +71,7 @@ class AgentLoop:
         sandbox: bool = False,
         permission_mode: str = "auto",
         thinking_budget: int = 0,
+        memory_search_config: Optional[Dict[str, Any]] = None,
         mcp_servers: dict | None = None,
         on_thinking: Callable[[str], None] | None = None,
         on_iteration: Callable[[int, int], None] | None = None,
@@ -100,6 +101,7 @@ class AgentLoop:
         self.auto_verify_command = auto_verify_command
         self.sandbox = sandbox
         self.thinking_budget = thinking_budget
+        self.memory_search_config = memory_search_config
         self.on_thinking = on_thinking
         self.on_iteration = on_iteration
         self.on_tool_start = on_tool_start
@@ -122,7 +124,7 @@ class AgentLoop:
             workspace=str(workspace),
         )
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, memory_search_config)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -1070,6 +1072,9 @@ class AgentLoop:
                 frequency_penalty=self.frequency_penalty,
                 thinking_budget=self.thinking_budget,
             ):
+                # Force event loop to process other tasks (like SIGINT/Ctrl+C)
+                await asyncio.sleep(0)
+
                 # Track usage
                 if chunk.usage:
                     for k in total_usage:
@@ -1087,6 +1092,7 @@ class AgentLoop:
                 # Text content — stream it out
                 if chunk.delta_content:
                     collected_content += chunk.delta_content
+                    yield chunk.delta_content
 
                 # Detect error responses
                 if chunk.finish_reason == "error":
@@ -1108,7 +1114,6 @@ class AgentLoop:
             if is_final_text and not tool_calls_data:
                 # Final text response — yield it and we're done
                 if collected_content:
-                    yield collected_content
                     final_content_parts.append(collected_content)
                 break
 
