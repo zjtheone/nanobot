@@ -360,6 +360,7 @@ def gateway(
         sandbox=config.agents.defaults.sandbox,
         permission_mode=config.agents.defaults.permission_mode,
         thinking_budget=config.agents.defaults.thinking_budget,
+        memory_search_config=config.memory_search.model_dump() if config.memory_search else None,
     )
 
     # Set cron callback (needs agent)
@@ -510,6 +511,7 @@ def agent(
         on_tool_start=progress.on_tool_start,
         on_status=progress.on_status,
         on_plan_progress=progress.on_plan_progress,
+        memory_search_config=config.memory_search.model_dump() if config.memory_search else None,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
