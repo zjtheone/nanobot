@@ -18,6 +18,7 @@ import logging
 from loguru import logger
 
 from .file_watcher import FileWatcher
+from .reranker import create_reranker, Reranker, DummyReranker
 
 # Optional imports
 try:
@@ -26,6 +27,13 @@ try:
 except ImportError:
     SQLITE_VEC_AVAILABLE = False
     logger.warning("sqlite-vec not installed, vector search will use numpy fallback")
+
+try:
+    import sqlite_vss
+    SQLITE_VSS_AVAILABLE = True
+except ImportError:
+    SQLITE_VSS_AVAILABLE = False
+    logger.warning("sqlite-vss not installed, vector search will fallback to sqlite-vec or numpy")
 
 try:
     from openai import OpenAI
@@ -50,6 +58,13 @@ try:
     LLAMA_CPP_AVAILABLE = True
 except ImportError:
     LLAMA_CPP_AVAILABLE = False
+
+# Query parser for enhanced hybrid search
+try:
+    from .memory_processing.query_parser import QueryParser
+    QUERY_PARSER_AVAILABLE = True
+except ImportError:
+    QUERY_PARSER_AVAILABLE = False
 
 
 @dataclass
@@ -228,8 +243,71 @@ class HybridSearch:
     
     def __init__(self, db_path: Path, config: Dict[str, Any]):
         self.db_path = db_path
-        self.vector_weight = config.get("hybrid_weight", 0.5)
-        self.text_weight = 1.0 - self.vector_weight
+        
+        # Enhanced hybrid search config
+        self.query_parser_enabled = config.get("query_parser_enabled", True)
+        self.rerank_method = config.get("rerank_method", "none")
+        self.rerank_top_k = config.get("rerank_top_k", 20)
+        self.cross_encoder_model = config.get("cross_encoder_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        self.score_normalization = config.get("score_normalization", True)
+        self.score_rescaling = config.get("score_rescaling", False)
+        
+        # Determine keyword and vector weights
+        # If explicit weights provided, use them (normalize if sum != 1)
+        kw = config.get("keyword_weight")
+        vw = config.get("vector_weight")
+        hw = config.get("hybrid_weight")
+        if kw is not None or vw is not None:
+            # At least one of the new weights is set
+            kw = kw if kw is not None else 0.4
+            vw = vw if vw is not None else 0.6
+            total = kw + vw
+            if total > 0:
+                self.keyword_weight = kw / total
+                self.vector_weight = vw / total
+            else:
+                self.keyword_weight = 0.4
+                self.vector_weight = 0.6
+        elif hw is not None:
+            # Backward compatibility: hybrid_weight -> vector_weight
+            self.vector_weight = float(hw)
+            self.keyword_weight = 1.0 - self.vector_weight
+        else:
+            # Default
+            self.keyword_weight = 0.4
+            self.vector_weight = 0.6
+        
+        # For backward compatibility with existing code
+        self.text_weight = self.keyword_weight
+        self.vector_weight = self.vector_weight  # redundant but clear
+        
+        # Query parser instance (optional)
+        self.query_parser = None
+        if self.query_parser_enabled and QUERY_PARSER_AVAILABLE:
+            try:
+                self.query_parser = QueryParser()
+            except Exception as e:
+                logger.warning(f"Failed to initialize QueryParser: {e}")
+                self.query_parser = None
+        
+        # Reranker instance (optional)
+        self.reranker = None
+        if self.rerank_method != "none":
+            reranker_config = {
+                "reranker_enabled": True,
+                "reranker_model": self.cross_encoder_model,
+                "reranker_device": None,
+                "reranker_max_length": 512,
+            }
+            try:
+                self.reranker = create_reranker(reranker_config)
+                if not self.reranker.is_available():
+                    logger.warning("Reranker is enabled but not available; will skip reranking.")
+                    self.reranker = None
+            except Exception as e:
+                logger.warning(f"Failed to initialize reranker: {e}")
+                self.reranker = None
+        
         self._conn = None
     
     def _get_connection(self):
@@ -238,9 +316,67 @@ class HybridSearch:
             self._conn.row_factory = sqlite3.Row
         return self._conn
     
+    def _analyze_query(self, query: str) -> Dict[str, Any]:
+        """
+        Analyze query using QueryParser if available, else fallback to simple tokenization.
+        Returns dict with keys: keywords, phrases, query_type, etc.
+        """
+        if self.query_parser:
+            try:
+                analysis = self.query_parser.parse(query)
+                # Convert to dict for compatibility
+                return {
+                    "keywords": analysis.keywords,
+                    "phrases": analysis.phrases,
+                    "query_type": analysis.query_type,
+                    "original_query": query,
+                    "analyzed": True
+                }
+            except Exception as e:
+                logger.warning(f"QueryParser failed to analyze '{query}': {e}")
+        
+        # Fallback: treat whole query as keyword (simple tokenization)
+        import re
+        tokens = re.findall(r'\w+', query.lower())
+        return {
+            "keywords": tokens,
+            "phrases": [query] if len(query.split()) > 1 else [],
+            "query_type": "keyword",
+            "original_query": query,
+            "analyzed": False
+        }
+    
     def search(self, query: str, limit: int = 10) -> List[Tuple[MemoryChunk, float]]:
         """Perform hybrid search and return chunks with relevance scores."""
         logger.info(f"HybridSearch searching for '{query}' (limit={limit})")
+        # Analyze query (enhanced hybrid search)
+        query_analysis = self._analyze_query(query)
+        # For now, keep using original query for FTS/vector; later we can adjust
+        effective_query = query_analysis.get("original_query", query)
+        query_type = query_analysis.get("query_type", "keyword")
+        # Compute adaptive weights based on query type (OpenClaw-style fusion)
+        text_weight = self.keyword_weight
+        vector_weight = self.vector_weight
+        # Adjust based on query type (simple heuristics)
+        if query_type == "keyword":
+            text_weight *= 1.5
+            vector_weight *= 0.8
+        elif query_type == "natural_language":
+            text_weight *= 0.8
+            vector_weight *= 1.5
+        elif query_type == "phrase":
+            # slight boost to both
+            text_weight *= 1.2
+            vector_weight *= 1.2
+        # Normalize so sum = 1
+        total = text_weight + vector_weight
+        if total > 0:
+            text_weight /= total
+            vector_weight /= total
+        else:
+            text_weight = self.keyword_weight
+            vector_weight = self.vector_weight
+        
         conn = self._get_connection()
         # Step 1: Full-text search (BM25) using SQLite FTS5
         # Assume we have an FTS table named 'memory_fts'
@@ -252,7 +388,7 @@ class HybridSearch:
                 WHERE memory_fts MATCH ?
                 ORDER BY bm25(memory_fts)
                 LIMIT ?
-            """, (query, limit * 2))
+            """, (effective_query, limit * 2))
             rows = cur.fetchall()
             for row in rows:
                 fts_scores[row['id']] = row['score']
@@ -271,7 +407,7 @@ class HybridSearch:
                 WHERE vec_search(embedding, ?)
                 ORDER BY distance
                 LIMIT ?
-            """, (self._text_to_vector(query), limit * 2))
+            """, (self._text_to_vector(effective_query), limit * 2))
             rows = cur.fetchall()
             for row in rows:
                 vector_scores[row['id']] = row['distance']
@@ -286,7 +422,7 @@ class HybridSearch:
             fts_score = fts_scores.get(chunk_id, 0.0)
             vector_score = vector_scores.get(chunk_id, 0.0)
             # Normalize? For simplicity, just weight
-            combined = self.text_weight * fts_score + self.vector_weight * (1.0 - vector_score)  # invert distance
+            combined = text_weight * fts_score + vector_weight * (1.0 - vector_score)  # invert distance
             scored.append((chunk_id, combined))
         scored.sort(key=lambda x: x[1], reverse=True)
         top_ids = [id_ for id_, _ in scored[:limit]]
@@ -344,6 +480,11 @@ class MemoryIndexManager:
         db_path_str = config.get("storage_path", workspace / "memory/vector/memory.db")
         self.db_path = Path(db_path_str)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Chunking configuration
+        self.chunk_size = config.get("chunk_size", 20)
+        self.chunk_overlap = config.get("chunk_overlap", 0)
+        self.chunk_boundary = config.get("chunk_boundary", "line")
+        self.semantic_boundary_threshold = config.get("semantic_boundary_threshold", 0.7)
         self.embedding_provider = EmbeddingProvider(config)
         self.hybrid_search = HybridSearch(self.db_path, config)
         self._setup_database()
@@ -420,6 +561,166 @@ class MemoryIndexManager:
         conn.commit()
         conn.close()
     
+    def _split_semantic(self, text: str, threshold: float = 0.7) -> List[tuple[int, int, str]]:
+        """Split text into semantic units based on sentence similarity.
+        
+        Uses sentence embeddings and detects topic shifts where cosine similarity
+        drops below threshold.
+        
+        Returns list of (start_line, end_line, unit_text).
+        """
+        # First split into sentences using the existing sentence boundary method
+        sentences = self._split_by_boundary(text, "sentence")
+        if len(sentences) <= 1:
+            return sentences  # no need to split further
+        
+        # Extract sentence texts and line ranges
+        sent_texts = [s[2] for s in sentences]
+        # Compute embeddings for each sentence in batch
+        embeddings = []
+        try:
+            # Use the same event‑loop pattern as index_file
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                # Running loop detected, create a new loop for embedding to avoid deadlock
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    embeddings = new_loop.run_until_complete(
+                        self.embedding_provider.embed(sent_texts, provider_name="sentence_transformer")
+                    )
+                finally:
+                    new_loop.close()
+                    asyncio.set_event_loop(loop)  # restore original loop
+            except RuntimeError:
+                # No running loop, create new one
+                loop = asyncio.new_event_loop()
+                try:
+                    embeddings = loop.run_until_complete(
+                        self.embedding_provider.embed(sent_texts, provider_name="sentence_transformer")
+                    )
+                finally:
+                    loop.close()
+        except Exception as e:
+            logger.warning(f"Embedding failed in semantic chunking: {e}. Falling back to sentence units.")
+            # Return sentences as units (no merging)
+            return sentences
+        
+        # Compute cosine similarity between consecutive sentences
+        # Use numpy for vector ops, but fallback to manual if not available
+        try:
+            import numpy as np
+            numpy_available = True
+        except ImportError:
+            numpy_available = False
+        
+        units = []
+        current_start_idx = 0
+        current_lines = [sentences[0][2]]
+        for i in range(1, len(sentences)):
+            # compute cosine similarity between embeddings[i-1] and embeddings[i]
+            if numpy_available:
+                a = np.array(embeddings[i-1])
+                b = np.array(embeddings[i])
+                cosine = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
+            else:
+                # manual dot product and norm
+                a = embeddings[i-1]
+                b = embeddings[i]
+                dot = sum(x * y for x, y in zip(a, b))
+                norm_a = sum(x * x for x in a) ** 0.5
+                norm_b = sum(y * y for y in b) ** 0.5
+                cosine = dot / (norm_a * norm_b + 1e-10)
+            
+            if cosine < threshold:
+                # boundary detected, finalize current unit
+                unit_text = " ".join(current_lines)
+                start_line = sentences[current_start_idx][0]
+                end_line = sentences[i-1][1]
+                units.append((start_line, end_line, unit_text))
+                # start new unit
+                current_start_idx = i
+                current_lines = [sentences[i][2]]
+            else:
+                current_lines.append(sentences[i][2])
+        # final unit
+        unit_text = " ".join(current_lines)
+        start_line = sentences[current_start_idx][0]
+        end_line = sentences[-1][1]
+        units.append((start_line, end_line, unit_text))
+        return units
+
+    def _split_by_boundary(self, text: str, boundary: str) -> List[tuple[int, int, str]]:
+        """Split text into units according to boundary.
+        
+        Returns list of (start_line, end_line, unit_text).
+        Start and end lines are 0‑based inclusive.
+        """
+        lines = text.splitlines()
+        if boundary == "line":
+            # Each line is a unit
+            units = []
+            for i, line in enumerate(lines):
+                units.append((i, i, line))
+            return units
+        elif boundary == "paragraph":
+            # Paragraphs are separated by blank lines (one or more empty lines)
+            units = []
+            current_start = 0
+            current_lines = []
+            for i, line in enumerate(lines):
+                if line.strip() == "":
+                    if current_lines:
+                        unit_text = "\n".join(current_lines)
+                        units.append((current_start, i - 1, unit_text))
+                        current_lines = []
+                        current_start = i + 1
+                    else:
+                        current_start = i + 1  # skip consecutive empty lines
+                else:
+                    current_lines.append(line)
+            # trailing paragraph
+            if current_lines:
+                unit_text = "\n".join(current_lines)
+                units.append((current_start, len(lines) - 1, unit_text))
+            return units
+        elif boundary == "sentence":
+            # Simple sentence splitting by punctuation followed by whitespace
+            import re
+            # Combine lines into single string with preserved line breaks
+            full_text = text  # original with line breaks
+            # Split by sentence boundaries (. ! ?) followed by whitespace or end
+            pattern = r'(?<=[.!?])\s+'
+            sentences = re.split(pattern, full_text)
+            # Map each sentence to line range (approximation)
+            units = []
+            line_pos = 0  # current line index
+            char_pos = 0  # character position in full_text
+            for sent in sentences:
+                if not sent.strip():
+                    continue
+                # Find start and end line of this sentence
+                sent_start = full_text.find(sent, char_pos)
+                if sent_start == -1:
+                    # fallback: assign to current line
+                    units.append((line_pos, line_pos, sent.strip()))
+                    char_pos += len(sent)
+                    continue
+                sent_end = sent_start + len(sent)
+                # Count newlines up to sent_start and sent_end
+                start_line = full_text.count('\n', 0, sent_start)
+                end_line = full_text.count('\n', 0, sent_end)
+                units.append((start_line, end_line, sent.strip()))
+                char_pos = sent_end
+            return units
+        elif boundary == "semantic":
+            # Use semantic similarity clustering
+            return self._split_semantic(text, self.semantic_boundary_threshold)
+        else:
+            # fallback to line
+            return [(i, i, line) for i, line in enumerate(lines)]
+    
     def index_file(self, file_path: Path) -> int:
         """Index a single memory file (full reindex). Returns number of chunks."""
         if not file_path.exists():
@@ -433,22 +734,30 @@ class MemoryIndexManager:
             logger.error(f"Failed to read {file_path}: {e}")
             return 0
         
-        # Split into chunks (simple line groups)
-        lines = text.splitlines()
+        # Split into units according to boundary
+        units = self._split_by_boundary(text, self.chunk_boundary)
         chunks = []
-        chunk_size = 20  # lines per chunk
-        for i in range(0, len(lines), chunk_size):
-            chunk_lines = lines[i:i+chunk_size]
-            chunk_text = "\n".join(chunk_lines)
+        chunk_size = self.chunk_size
+        overlap = self.chunk_overlap
+        if overlap >= chunk_size:
+            overlap = chunk_size - 1  # prevent zero or negative step
+        step = chunk_size - overlap
+        for i in range(0, len(units), step):
+            chunk_units = units[i:i+chunk_size]
+            # Merge unit texts
+            chunk_text = "\n".join([unit[2] for unit in chunk_units])
             if not chunk_text.strip():
                 continue
+            # Compute overall line range
+            start_line = chunk_units[0][0] if chunk_units else 0
+            end_line = chunk_units[-1][1] if chunk_units else 0
             chunk_hash = hashlib.md5(chunk_text.encode()).hexdigest()
-            chunk_id = f"{file_path.relative_to(self.workspace)}_{i}_{i+len(chunk_lines)}"
+            chunk_id = f"{file_path.relative_to(self.workspace)}_{start_line}_{end_line}"
             chunks.append({
                 "id": chunk_id,
                 "file_path": str(file_path.relative_to(self.workspace)),
-                "start_line": i,
-                "end_line": i + len(chunk_lines) - 1,
+                "start_line": start_line,
+                "end_line": end_line,
                 "text": chunk_text,
                 "hash": chunk_hash,
             })

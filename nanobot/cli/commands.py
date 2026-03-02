@@ -288,6 +288,36 @@ This file stores important information that should persist across sessions.
 
 
 def _make_provider(config):
+    """Create provider from config. Exits if no API key found."""
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.custom_provider import CustomProvider
+    from nanobot.providers.registry import find_by_name
+
+    p = config.get_provider()
+    model = config.agents.defaults.model
+    provider_name = config.get_provider_name()
+    
+    if not (p and p.api_key) and not model.startswith("bedrock/"):
+        console.print("[red]Error: No API key configured.[/red]")
+        console.print("Set one in ~/.nanobot/config.json under providers section")
+        raise typer.Exit(1)
+    
+    # Check if this is a direct provider (bypasses LiteLLM)
+    spec = find_by_name(provider_name) if provider_name else None
+    if spec and spec.is_direct:
+        return CustomProvider(
+            api_key=p.api_key,
+            api_base=config.get_api_base(),
+            default_model=model,
+        )
+    
+    return LiteLLMProvider(
+        api_key=p.api_key if p else None,
+        api_base=config.get_api_base(),
+        default_model=model,
+        extra_headers=p.extra_headers if p else None,
+        provider_name=provider_name,
+    )
     """Create LiteLLMProvider from config. Exits if no API key found."""
     from nanobot.providers.litellm_provider import LiteLLMProvider
 
@@ -554,6 +584,9 @@ def agent(
                             
                     if not markdown and full_response:
                         print()
+                except Exception as e:
+                    console.print(f"\n[red]Error:[/red] {e}")
+                    import traceback; console.print(f"[dim]{traceback.format_exc()}[/dim]")
                 finally:
                     if live is not None:
                         live.stop()
@@ -645,6 +678,9 @@ def agent(
                                         
                                 if not markdown and full_response:
                                     print()
+                            except Exception as e:
+                                console.print(f"\n[red]Error:[/red] {e}")
+                                import traceback; console.print(f"[dim]{traceback.format_exc()}[/dim]")
                             finally:
                                 if live is not None:
                                     live.stop()
@@ -653,7 +689,8 @@ def agent(
                         try:
                             await _current_task
                         except asyncio.CancelledError:
-                            pass
+                            console.print("\n[yellow]Interrupted.[/yellow]")
+                            break  # Exit the interactive loop on Ctrl+C
                         finally:
                             _current_task = None
                     else:
@@ -666,7 +703,8 @@ def agent(
                             response = await _current_task
                             _print_agent_response(response, render_markdown=markdown)
                         except asyncio.CancelledError:
-                            pass
+                            console.print("\n[yellow]Interrupted.[/yellow]")
+                            break  # Exit the interactive loop on Ctrl+C
                         finally:
                             _current_task = None
 
@@ -680,6 +718,10 @@ def agent(
                     _restore_terminal()
                     console.print("\nGoodbye!")
                     break
+                except Exception as e:
+                    console.print(f"\n[red]Error:[/red] {e}")
+                    import traceback; console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                    continue
                 except EOFError:
                     _restore_terminal()
                     console.print("\nGoodbye!")

@@ -208,6 +208,7 @@ class ProviderConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     """Configuration for LLM providers."""
 
+    custom: ProviderConfig = Field(default_factory=ProviderConfig)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -266,6 +267,54 @@ class MCPServerConfig(BaseModel):
     enabled: bool = True
 
 
+class MemorySearchConfig(BaseModel):
+    """Memory search configuration."""
+
+    enabled: bool = True
+    max_distance: float = 0.4
+    hybrid_weight: float = 0.5
+    top_k: int = 10
+    use_embedding_fallback: bool = True
+    embedding_provider: str = "openai"  # openai, gemini, llama
+    openai_api_key: str = ""
+    openai_api_base: str = ""
+    openai_model: str = "text-embedding-3-small"
+    gemini_api_key: str = ""
+    gemini_model: str = "models/text-embedding-004"
+    llama_model_path: str = ""
+    llama_n_gpu_layers: int = -1
+    storage_path: str = "memory/vector"
+    # File watching configuration
+    watch_paths: list[str] = Field(default_factory=lambda: ["memory"])
+    watch_interval: float = 5.0
+    # Chunking configuration
+    chunk_size: int = 20  # lines per chunk
+    chunk_overlap: int = 0  # lines overlap between chunks
+    chunk_boundary: str = "line"  # "line", "paragraph", "sentence", "markdown_heading", "semantic"
+    semantic_boundary_threshold: float = 0.7  # similarity threshold for semantic segmentation
+    # Enhanced hybrid search options
+    query_parser_enabled: bool = True
+    keyword_weight: float = 0.4
+    vector_weight: float = 0.6
+    rerank_method: str = "none"  # "none", "similarity", "cross_encoder"
+    rerank_top_k: int = 20
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    score_normalization: bool = True
+    score_rescaling: bool = False
+    # Embedding provider configuration
+    embedding_fallback_chain: list[str] = Field(
+        default_factory=lambda: ["openai", "gemini", "sentence_transformer", "local_llama", "none"]
+    )
+    sentence_transformer_model: str = "all-MiniLM-L6-v2"
+    embedding_cache_size: int = 1000
+    # Vector search backend configuration
+    vector_search_backend: str = "sqlite-vec"  # "sqlite-vec", "sqlite-vss", "none"
+    sqlite_vss_extension_path: str = ""
+    # Reranker fine-tuning
+    reranker_device: str = "cpu"  # "cpu", "cuda", "mps"
+    reranker_max_length: int = 512
+
+
 class MCPConfig(BaseModel):
     """MCP (Model Context Protocol) configuration."""
 
@@ -280,6 +329,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory_search: MemorySearchConfig = Field(default_factory=MemorySearchConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     @property

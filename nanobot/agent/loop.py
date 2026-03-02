@@ -277,6 +277,10 @@ class AgentLoop:
 
         self.planner = Planner(self.provider, self.context, self.workspace)
         self.tools.register(PlanTool(self.planner))
+
+        # Memory Search Tool (Phase 6)
+        from nanobot.agent.tools.memory_search import MemorySearchTool
+        self.tools.register(MemorySearchTool(self.context.memory))
         self.tools.register(UpdatePlanStepTool(self.planner))
 
         # Wire plan progress callback
@@ -885,7 +889,6 @@ class AgentLoop:
 
         if total_chars <= threshold:
             return messages
-
         logger.info(f"Smart compaction triggered: {total_chars} chars > {threshold} threshold")
         if self.on_status:
             try:

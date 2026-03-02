@@ -4,7 +4,7 @@ import base64
 import mimetypes
 import platform
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Dict
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
@@ -27,9 +27,9 @@ class ContextBuilder:
         "CLAUDE.md", "NANOBOT.md", ".nanobot.md", "CONTRIBUTING.md",
     ]
     
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, memory_search_config: Optional[Dict[str, Any]] = None):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory = MemoryStore(workspace, memory_search_config)
         self.skills = SkillsLoader(workspace)
         self.repomap = RepoMap(workspace)
         self.folding_engine = FoldingEngine(workspace)
