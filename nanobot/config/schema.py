@@ -1,6 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Any
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings
 
@@ -409,3 +410,116 @@ class Config(BaseSettings):
         return None
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
+
+
+# ============================================================================
+# Agent-to-Agent Configuration Models
+# ============================================================================
+
+class SubagentConfig(BaseModel):
+    """Subagent configuration."""
+    model: str | None = None  # Override model for subagents
+    temperature: float | None = None  # Override temperature
+    max_tokens: int | None = None  # Override max_tokens
+    max_spawn_depth: int = 1  # Maximum spawn depth (1=no nesting, 2=orchestrator pattern)
+    max_children_per_agent: int = 5  # Max active children per agent session
+    max_concurrent: int = 8  # Global concurrency limit
+    run_timeout_seconds: int = 0  # Default timeout (0=no timeout)
+    archive_after_minutes: int = 60  # Auto-archive after N minutes
+
+
+class AgentToAgentPolicy(BaseModel):
+    """Agent-to-Agent communication policy."""
+    enabled: bool = False  # Enable/disable A2A communication
+    allow: list[str] = Field(default_factory=list)  # Allowed agent IDs ("*" for all)
+    deny: list[str] = Field(default_factory=list)  # Denied agent IDs
+    max_ping_pong_turns: int = 5  # Maximum automatic ping-pong turns
+
+
+class SessionVisibilityPolicy(BaseModel):
+    """Session visibility policy for tools."""
+    visibility: str = "tree"  # self | tree | agent | all
+    
+    @property
+    def is_self(self) -> bool:
+        return self.visibility == "self"
+    
+    @property
+    def is_tree(self) -> bool:
+        return self.visibility == "tree"
+    
+    @property
+    def is_agent(self) -> bool:
+        return self.visibility == "agent"
+    
+    @property
+    def is_all(self) -> bool:
+        return self.visibility == "all"
+
+
+class AgentConfig(BaseModel):
+    """Individual agent configuration."""
+    id: str = Field(..., min_length=1, max_length=64, description="Agent identifier")
+    name: str | None = Field(None, description="Human-readable agent name")
+    workspace: Path | None = Field(None, description="Workspace directory")
+    agent_dir: Path | None = Field(None, description="Agent state directory")
+    model: str | None = Field(None, description="Default model for this agent")
+    temperature: float = Field(0.7, ge=0.0, le=2.0, description="Temperature")
+    max_tokens: int = Field(4096, ge=1, description="Max tokens")
+    
+    # Subagent settings
+    subagents: SubagentConfig = Field(default_factory=SubagentConfig)
+    
+    # Tool policies
+    sandbox: dict[str, Any] = Field(default_factory=dict)
+    tools: dict[str, Any] = Field(default_factory=dict)
+    
+    def get_workspace_path(self) -> Path:
+        """Get resolved workspace path."""
+        if self.workspace:
+            return self.workspace.expanduser()
+        return Path.home() / ".nanobot" / f"workspace-{self.id}"
+    
+    def get_agent_dir_path(self) -> Path:
+        """Get resolved agent directory path."""
+        if self.agent_dir:
+            return self.agent_dir.expanduser()
+        return Path.home() / ".nanobot" / "agents" / self.id / "agent"
+
+
+class AgentsConfig(BaseModel):
+    """Multi-agent configuration."""
+    defaults: AgentConfig = Field(default_factory=lambda: AgentConfig(id="default"))
+    agent_list: list[AgentConfig] = Field(default_factory=list)
+    
+    def get_agent(self, agent_id: str) -> AgentConfig:
+        """Get agent config by ID, falling back to defaults."""
+        for agent in self.agent_list:
+            if agent.id == agent_id:
+                return agent
+        # Return defaults with overridden id
+        default = self.defaults.model_copy()
+        default.id = agent_id
+        return default
+    
+    def has_agent(self, agent_id: str) -> bool:
+        """Check if an agent is configured."""
+        return any(a.id == agent_id for a in self.agent_list)
+    
+    def list_agent_ids(self) -> list:
+        """Get list of configured agent IDs."""
+        return [a.id for a in self.agent_list]
+
+
+class ToolsConfig(BaseModel):
+    """Tool configuration."""
+    agent_to_agent: AgentToAgentPolicy = Field(default_factory=AgentToAgentPolicy)
+    sessions: SessionVisibilityPolicy = Field(default_factory=SessionVisibilityPolicy)
+
+
+# Update Config class to include new fields
+# Note: We'll add these as optional fields to maintain backward compatibility
+class ConfigExtensions(BaseModel):
+    """Extension fields for Config class."""
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)

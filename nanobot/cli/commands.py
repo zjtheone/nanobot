@@ -623,9 +623,9 @@ def agent(
 
                 now = _time.time()
                 if _current_task and not _current_task.done():
-                    # First Ctrl+C: cancel current task
+                    # First Ctrl+C: cancel current task (interrupt, don't exit)
                     _current_task.cancel()
-                    console.print("\n[yellow]Interrupted.[/yellow]")
+                    console.print("\n[yellow]⚡ Interrupted. What would you like to adjust?[/yellow]")
                     _last_interrupt = now
                 elif now - _last_interrupt < 2.0:
                     # Second Ctrl+C within 2s: exit
@@ -689,8 +689,8 @@ def agent(
                         try:
                             await _current_task
                         except asyncio.CancelledError:
-                            console.print("\n[yellow]Interrupted.[/yellow]")
-                            break  # Exit the interactive loop on Ctrl+C
+                            console.print("\n[yellow]⚡ Thought process interrupted. What would you like to adjust?[/yellow]")
+                            # DON'T break - return to input prompt for user adjustment
                         finally:
                             _current_task = None
                     else:
@@ -703,8 +703,8 @@ def agent(
                             response = await _current_task
                             _print_agent_response(response, render_markdown=markdown)
                         except asyncio.CancelledError:
-                            console.print("\n[yellow]Interrupted.[/yellow]")
-                            break  # Exit the interactive loop on Ctrl+C
+                            console.print("\n[yellow]⚡ Interrupted. What's your next instruction?[/yellow]")
+                            # DON'T break - return to input prompt for user adjustment
                         finally:
                             _current_task = None
 
@@ -1175,3 +1175,22 @@ def status():
 
 if __name__ == "__main__":
     app()
+
+
+# ============================================================================
+# A2A CLI Commands Integration
+# ============================================================================
+
+# Import subagents and sessions CLI apps
+try:
+    from nanobot.cli.subagents import subagents_app
+    app.add_typer(subagents_app, name="subagents", help="Manage subagent runs")
+except ImportError:
+    pass
+
+try:
+    from nanobot.cli.sessions import sessions_app
+    app.add_typer(sessions_app, name="sessions", help="Manage session bindings")
+except ImportError:
+    pass
+
