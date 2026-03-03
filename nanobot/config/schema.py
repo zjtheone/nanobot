@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
@@ -193,9 +195,26 @@ class AgentDefaults(BaseModel):
 
 
 class AgentsConfig(BaseModel):
-    """Agent configuration."""
-
-    defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    """Multi-agent configuration."""
+    defaults: AgentConfig = Field(default_factory=lambda: AgentConfig(id="default"))
+    agent_list: list[AgentConfig] = Field(default_factory=list)
+    
+    def get_agent(self, agent_id: str) -> AgentConfig:
+        """Get agent config by ID."""
+        for agent in self.agent_list:
+            if agent.id == agent_id:
+                return agent
+        default = self.defaults.model_copy()
+        default.id = agent_id
+        return default
+    
+    def has_agent(self, agent_id: str) -> bool:
+        """Check if agent is configured."""
+        return any(a.id == agent_id for a in self.agent_list)
+    
+    def list_agent_ids(self) -> list:
+        """Get list of agent IDs."""
+        return [a.id for a in self.agent_list]
 
 
 class ProviderConfig(BaseModel):
@@ -251,12 +270,43 @@ class ExecToolConfig(BaseModel):
     sandbox_image: str = "python:3.12-slim"
 
 
+class AgentToAgentPolicy(BaseModel):
+    """Agent-to-Agent communication policy."""
+    enabled: bool = False  # Enable/disable A2A communication
+    allow: list[str] = Field(default_factory=list)  # Allowed agent IDs ("*" for all)
+    deny: list[str] = Field(default_factory=list)  # Denied agent IDs
+    max_ping_pong_turns: int = 5  # Maximum automatic ping-pong turns
+
+
+class SessionVisibilityPolicy(BaseModel):
+    """Session visibility policy for tools."""
+    visibility: str = "tree"  # self | tree | agent | all
+    
+    @property
+    def is_self(self) -> bool:
+        return self.visibility == "self"
+    
+    @property
+    def is_tree(self) -> bool:
+        return self.visibility == "tree"
+    
+    @property
+    def is_agent(self) -> bool:
+        return self.visibility == "agent"
+    
+    @property
+    def is_all(self) -> bool:
+        return self.visibility == "all"
+
+
 class ToolsConfig(BaseModel):
-    """Tools configuration."""
+    """Tools configuration with A2A support."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    restrict_to_workspace: bool = False
+    agent_to_agent: AgentToAgentPolicy = Field(default_factory=AgentToAgentPolicy)
+    sessions: SessionVisibilityPolicy = Field(default_factory=SessionVisibilityPolicy)
 
 
 class MCPServerConfig(BaseModel):
@@ -428,35 +478,6 @@ class SubagentConfig(BaseModel):
     archive_after_minutes: int = 60  # Auto-archive after N minutes
 
 
-class AgentToAgentPolicy(BaseModel):
-    """Agent-to-Agent communication policy."""
-    enabled: bool = False  # Enable/disable A2A communication
-    allow: list[str] = Field(default_factory=list)  # Allowed agent IDs ("*" for all)
-    deny: list[str] = Field(default_factory=list)  # Denied agent IDs
-    max_ping_pong_turns: int = 5  # Maximum automatic ping-pong turns
-
-
-class SessionVisibilityPolicy(BaseModel):
-    """Session visibility policy for tools."""
-    visibility: str = "tree"  # self | tree | agent | all
-    
-    @property
-    def is_self(self) -> bool:
-        return self.visibility == "self"
-    
-    @property
-    def is_tree(self) -> bool:
-        return self.visibility == "tree"
-    
-    @property
-    def is_agent(self) -> bool:
-        return self.visibility == "agent"
-    
-    @property
-    def is_all(self) -> bool:
-        return self.visibility == "all"
-
-
 class AgentConfig(BaseModel):
     """Individual agent configuration."""
     id: str = Field(..., min_length=1, max_length=64, description="Agent identifier")
@@ -466,6 +487,14 @@ class AgentConfig(BaseModel):
     model: str | None = Field(None, description="Default model for this agent")
     temperature: float = Field(0.7, ge=0.0, le=2.0, description="Temperature")
     max_tokens: int = Field(4096, ge=1, description="Max tokens")
+    max_tool_iterations: int = Field(20, ge=1, description="Max tool iterations")
+    context_window: int = Field(120000, ge=1000, description="Context window in chars")
+    auto_verify: bool = Field(True, description="Auto-verify after changes")
+    auto_verify_command: str = Field("", description="Auto-verify command")
+    sandbox: bool = Field(False, description="Enable sandbox mode")
+    permission_mode: str = Field("auto", description="Permission mode")
+    frequency_penalty: float = Field(0.0, ge=0.0, le=2.0, description="Frequency penalty")
+    thinking_budget: int = Field(0, ge=0, description="Thinking budget")
     
     # Subagent settings
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
