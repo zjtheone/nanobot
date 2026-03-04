@@ -322,7 +322,55 @@ class AnnounceChainManager:
         self._aggregations.clear()
         self._session_children.clear()
         logger.debug("Cleared announce chain manager")
-
+    
+    async def wait_for_children(
+        self,
+        parent_session_key: str,
+        timeout: float = 300,
+        poll_interval: float = 1.0,
+    ) -> AggregatedResult | None:
+        """等待指定 parent session 的所有子任务完成。
+        
+        轮询检查子任务完成情况，直到所有子任务完成或超时。
+        
+        Args:
+            parent_session_key: 父 session key
+            timeout: 超时时间（秒）
+            poll_interval: 轮询间隔（秒）
+        
+        Returns:
+            AggregatedResult 如果完成，None 如果超时
+        """
+        import asyncio
+        import time
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # 检查是否有聚合结果
+            aggregation = self._aggregations.get(parent_session_key)
+            
+            if aggregation and aggregation.children:
+                # 所有已注册的孩子都已完成（announce 是同步触发的）
+                return aggregation
+            
+            # 等待下一次轮询
+            await asyncio.sleep(poll_interval)
+        
+        # 超时
+        logger.warning(
+            f"Timeout waiting for children of {parent_session_key} after {timeout}s"
+        )
+        return None
+    
+    def get_children_count(self, parent_session_key: str) -> int:
+        """获取指定 parent 的子任务数量。"""
+        event_ids = self._session_children.get(parent_session_key, [])
+        return len(event_ids)
+    
+    def has_children(self, parent_session_key: str) -> bool:
+        """检查指定 parent 是否有子任务。"""
+        return self.get_children_count(parent_session_key) > 0
 
 def create_announce_event(
     task_id: str,

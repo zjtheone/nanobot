@@ -198,23 +198,38 @@ class AgentsConfig(BaseModel):
     """Multi-agent configuration."""
     defaults: AgentConfig = Field(default_factory=lambda: AgentConfig(id="default"))
     agent_list: list[AgentConfig] = Field(default_factory=list)
+    bindings: list["AgentBinding"] = Field(default_factory=list)  # 新增：消息路由规则
+    teams: list["TeamConfig"] = Field(default_factory=list)      # 新增：Agent Team 分组
+    default_agent: str = "default"                                # 新增：默认 agent ID
     
     def get_agent(self, agent_id: str) -> AgentConfig:
-        """Get agent config by ID."""
+        """Get agent config by ID, falling back to defaults."""
         for agent in self.agent_list:
             if agent.id == agent_id:
                 return agent
+        # Return defaults with overridden id
         default = self.defaults.model_copy()
         default.id = agent_id
         return default
     
     def has_agent(self, agent_id: str) -> bool:
-        """Check if agent is configured."""
+        """Check if an agent is configured."""
         return any(a.id == agent_id for a in self.agent_list)
     
     def list_agent_ids(self) -> list:
-        """Get list of agent IDs."""
+        """Get list of configured agent IDs."""
         return [a.id for a in self.agent_list]
+    
+    def get_team(self, name: str) -> "TeamConfig | None":
+        """Get team config by name."""
+        for team in self.teams:
+            if team.name == name:
+                return team
+        return None
+    
+    def list_teams(self) -> list["TeamConfig"]:
+        """Get list of configured teams."""
+        return self.teams
 
 
 class ProviderConfig(BaseModel):
@@ -241,6 +256,7 @@ class ProvidersConfig(BaseModel):
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local LLM
 
 
 class GatewayConfig(BaseModel):
@@ -399,10 +415,18 @@ class Config(BaseSettings):
         normalized_prefix = model_prefix.replace("-", "_")
 
         # Prefer explicit provider prefix match (e.g., "github-copilot/" -> github_copilot)
+        # Also handle variations like "ollama_chat" -> "ollama"
         for spec in PROVIDERS:
             if model_prefix and normalized_prefix == spec.name:
                 p = getattr(self.providers, spec.name, None)
                 # OAuth providers don't need api_key
+                if spec.is_oauth:
+                    return p or ProviderConfig(), spec.name
+                if p and p.api_key:
+                    return p, spec.name
+            # Handle "ollama_chat" -> "ollama" pattern
+            if model_prefix and normalized_prefix == spec.name + "_chat":
+                p = getattr(self.providers, spec.name, None)
                 if spec.is_oauth:
                     return p or ProviderConfig(), spec.name
                 if p and p.api_key:
@@ -516,39 +540,24 @@ class AgentConfig(BaseModel):
         return Path.home() / ".nanobot" / "agents" / self.id / "agent"
 
 
-class AgentsConfig(BaseModel):
-    """Multi-agent configuration."""
-    defaults: AgentConfig = Field(default_factory=lambda: AgentConfig(id="default"))
-    agent_list: list[AgentConfig] = Field(default_factory=list)
-    
-    def get_agent(self, agent_id: str) -> AgentConfig:
-        """Get agent config by ID, falling back to defaults."""
-        for agent in self.agent_list:
-            if agent.id == agent_id:
-                return agent
-        # Return defaults with overridden id
-        default = self.defaults.model_copy()
-        default.id = agent_id
-        return default
-    
-    def has_agent(self, agent_id: str) -> bool:
-        """Check if an agent is configured."""
-        return any(a.id == agent_id for a in self.agent_list)
-    
-    def list_agent_ids(self) -> list:
-        """Get list of configured agent IDs."""
-        return [a.id for a in self.agent_list]
+
+# ============================================================================
+# Agent Team Configuration Models
+# ============================================================================
+
+class AgentBinding(BaseModel):
+    """消息路由规则：将特定 channel/chat 绑定到特定 agent。"""
+    agent_id: str                          # 目标 agent ID
+    channels: list[str] = Field(default_factory=list)  # 匹配的 channel 名称列表，如 ["telegram", "slack"]
+    chat_ids: list[str] = Field(default_factory=list)   # 匹配的 chat_id 列表
+    chat_pattern: str | None = None        # chat_id 正则匹配
+    keywords: list[str] = Field(default_factory=list)   # 消息内容关键词匹配
+    priority: int = 0                      # 优先级，越大越优先
 
 
-class ToolsConfig(BaseModel):
-    """Tool configuration."""
-    agent_to_agent: AgentToAgentPolicy = Field(default_factory=AgentToAgentPolicy)
-    sessions: SessionVisibilityPolicy = Field(default_factory=SessionVisibilityPolicy)
-
-
-# Update Config class to include new fields
-# Note: We'll add these as optional fields to maintain backward compatibility
-class ConfigExtensions(BaseModel):
-    """Extension fields for Config class."""
-    agents: AgentsConfig = Field(default_factory=AgentsConfig)
-    tools: ToolsConfig = Field(default_factory=ToolsConfig)
+class TeamConfig(BaseModel):
+    """Agent Team 分组定义。"""
+    name: str                              # team 名称
+    members: list[str]                     # agent IDs
+    leader: str | None = None              # leader agent（可选）
+    strategy: str = "parallel"             # parallel | sequential | leader_delegate

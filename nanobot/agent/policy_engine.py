@@ -5,17 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import AgentToAgentPolicy, SessionVisibilityPolicy
-
-
-class PolicyCheckResult(Enum):
-    """Result of a policy check."""
-
-    ALLOWED = "allowed"
-    DENIED = "denied"
-    DISABLED = "disabled"
-    DEPTH_EXCEEDED = "depth_exceeded"
-    NOT_IN_ALLOWLIST = "not_in_allowlist"
+    from nanobot.config.schema import AgentToAgentPolicy, SessionVisibilityPolicy, RateLimitPolicy
     IN_DENYLIST = "in_denylist"
 
 
@@ -62,7 +52,11 @@ class AgentToAgentPolicyEngine:
             policy: AgentToAgentPolicy configuration
         """
         self.policy = policy
-
+        
+        # Rate limiting tracking
+        from collections import defaultdict
+        self._spawn_timestamps: defaultdict[str, list[float]] = defaultdict(list)
+        self._concurrent_spawns: defaultdict[str, int] = defaultdict(int)
     def check_spawn_allowed(
         self,
         requester_agent_id: str,
@@ -147,6 +141,71 @@ class AgentToAgentPolicyEngine:
                 "depth": current_depth,
             },
         )
+    
+    def check_rate_limit(
+        self,
+        agent_id: str,
+        max_spawns_per_minute: int = 10,
+        max_concurrent: int = 8,
+    ) -> PolicyDecision:
+        """检查 rate limit 是否允许 spawn。
+        
+        Args:
+            agent_id: Agent 标识
+            max_spawns_per_minute: 每分钟最大 spawn 数
+            max_concurrent: 最大并发 spawn 数
+        
+        Returns:
+            PolicyDecision
+        """
+        import time
+        
+        current_time = time.time()
+        one_minute_ago = current_time - 60
+        
+        # Clean old timestamps
+        timestamps = self._spawn_timestamps[agent_id]
+        self._spawn_timestamps[agent_id] = [t for t in timestamps if t > one_minute_ago]
+        
+        # Check spawns per minute
+        if len(self._spawn_timestamps[agent_id]) >= max_spawns_per_minute:
+            return PolicyDecision(
+                result=PolicyCheckResult.DENIED,
+                message=f"Rate limit exceeded: {len(self._spawn_timestamps[agent_id])} spawns in last minute (limit: {max_spawns_per_minute})",
+                details={
+                    "agent_id": agent_id,
+                    "spawns_last_minute": len(self._spawn_timestamps[agent_id]),
+                    "limit": max_spawns_per_minute,
+                },
+            )
+        
+        # Check concurrent spawns
+        if self._concurrent_spawns[agent_id] >= max_concurrent:
+            return PolicyDecision(
+                result=PolicyCheckResult.DENIED,
+                message=f"Concurrent spawn limit exceeded: {self._concurrent_spawns[agent_id]} active (limit: {max_concurrent})",
+                details={
+                    "agent_id": agent_id,
+                    "concurrent_spawns": self._concurrent_spawns[agent_id],
+                    "limit": max_concurrent,
+                },
+            )
+        
+        return PolicyDecision(
+            result=PolicyCheckResult.ALLOWED,
+            message="Rate limit check passed",
+        )
+    
+    def record_spawn(self, agent_id: str) -> None:
+        """记录一次 spawn 事件。"""
+        import time
+        self._spawn_timestamps[agent_id].append(time.time())
+        self._concurrent_spawns[agent_id] += 1
+    
+    def record_spawn_complete(self, agent_id: str) -> None:
+        """记录 spawn 完成。"""
+        if self._concurrent_spawns[agent_id] > 0:
+            self._concurrent_spawns[agent_id] -= 1
 
     def check_ping_pong_allowed(
         self,

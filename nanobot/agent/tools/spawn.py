@@ -82,7 +82,7 @@ class SpawnTool(Tool):
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The task for the subagent to complete",
+                    "description": "The task for the subagent to complete (required for single spawn)",
                 },
                 "label": {
                     "type": "string",
@@ -92,28 +92,74 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional target agent ID (default: same as current agent)",
                 },
+                # Batch spawn parameters
+                "batch": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": {"type": "string", "description": "Task description"},
+                            "label": {"type": "string", "description": "Optional label"},
+                        },
+                        "required": ["task"],
+                    },
+                    "description": "Batch spawn: array of tasks to spawn in parallel",
+                },
+                "wait": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Wait for batch results (only for batch mode)",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "default": 300,
+                    "description": "Timeout in seconds for batch wait (only for batch mode)",
+                },
             },
-            "required": ["task"],
+            "required": [],  # Either 'task' or 'batch' is required
         }
 
     async def execute(
         self,
-        task: str,
+        task: str | None = None,
         label: str | None = None,
         agent_id: str | None = None,
+        batch: list[dict] | None = None,
+        wait: bool = False,
+        timeout: int = 300,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task.
 
         Args:
-            task: Task description
-            label: Optional label
+            task: Task description (for single spawn)
+            label: Optional label (for single spawn)
             agent_id: Optional target agent ID
+            batch: Batch spawn - list of {task, label} dicts
+            wait: Wait for batch results (only for batch mode)
+            timeout: Timeout in seconds for batch wait
             **kwargs: Additional arguments
 
         Returns:
             Result message (success or error)
         """
+        # Batch mode
+        if batch:
+            return await self._execute_batch(batch, wait, timeout)
+        
+        # Single spawn mode
+        if not task:
+            return "Error: Either 'task' or 'batch' parameter is required"
+        
+        return await self._spawn_single(task, label, agent_id)
+    
+    async def _spawn_single(
+        self,
+        task: str,
+        label: str | None = None,
+        agent_id: str | None = None,
+    ) -> str:
+        """Spawn a single subagent."""
         target_agent_id = agent_id or self._agent_id
 
         # Check A2A policy
@@ -139,6 +185,66 @@ class SpawnTool(Tool):
             return result
         except Exception as e:
             return f"Error spawning subagent: {str(e)}"
+    
+    async def _execute_batch(
+        self,
+        batch: list[dict],
+        wait: bool = False,
+        timeout: int = 300,
+    ) -> str:
+        """Execute batch spawn.
+        
+        Args:
+            batch: List of {task, label} dicts
+            wait: Wait for all results
+            timeout: Timeout for wait
+        
+        Returns:
+            Formatted results
+        """
+        if not batch:
+            return "Error: Batch cannot be empty"
+        
+        import asyncio
+        
+        # Spawn all tasks
+        tasks = []
+        for item in batch:
+            task_desc = item.get("task", "")
+            label = item.get("label")
+            
+            if not task_desc:
+                continue
+            
+            # Create coroutine for each spawn
+            coro = self._spawn_single(task_desc, label)
+            tasks.append(coro)
+        
+        if not tasks:
+            return "Error: No valid tasks in batch"
+        
+        # Execute all spawns in parallel
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            return f"Error in batch spawn: {str(e)}"
+        
+        if not wait:
+            # Return immediately with task IDs
+            return f"Spawned {len(results)} subagents. Use wait_for_children to collect results."
+        
+        # Format results
+        output_lines = [f"Batch spawn completed ({len(results)} tasks):\n"]
+        for i, (item, result) in enumerate(zip(batch, results), 1):
+            label = item.get("label", f"Task {i}")
+            if isinstance(result, Exception):
+                output_lines.append(f"  {label}: FAILED - {str(result)}")
+            else:
+                # Result is already a string from _spawn_single
+                result_str = str(result)
+                output_lines.append(f"  {label}: {result_str[:200]}..." if len(result_str) > 200 else f"  {label}: {result_str}")
+        
+        return "\n".join(output_lines)
 
     def _check_spawn_policy(self, target_agent_id: str) -> "PolicyDecision":
         """Check if spawning is allowed by policy.

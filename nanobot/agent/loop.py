@@ -32,7 +32,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ExecToolConfig
+    from nanobot.config.schema import ExecToolConfig, AgentsConfig
     from nanobot.cron.service import CronService
 
 
@@ -78,6 +78,7 @@ class AgentLoop:
         on_tool_start: Callable[[str, dict], None] | None = None,
         on_status: Callable[[str], None] | None = None,
         on_plan_progress: Callable[[list], None] | None = None,
+        agents_config: "AgentsConfig | None" = None,  # 新增：用于 Broadcast 工具
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -111,6 +112,9 @@ class AgentLoop:
         # MCP support (from nanobot version)
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
+        
+        # Store agents config for Broadcast tool
+        self._agents_config = agents_config
         self._mcp_connected = False
         self._mcp_connecting = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
@@ -316,6 +320,22 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+        
+        # Broadcast tool (for team communication)
+        if self._agents_config:
+            from nanobot.agent.tools.broadcast import BroadcastTool
+            broadcast_tool = BroadcastTool(
+                manager=self.subagents,
+                agents_config=self._agents_config,
+            )
+            # Set context for broadcast tool
+            broadcast_tool.set_context(
+                channel="cli",
+                chat_id="direct",
+                session_key="cli:direct",
+                agent_id="default",
+            )
+            self.tools.register(broadcast_tool)
 
         # Cron tool (for scheduling)
         if self.cron_service:
@@ -416,8 +436,9 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
+        agent_id = key.split(":")[0] if key and ":" in key else "unknown"
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+        logger.info(f"🤖 [{agent_id}] Processing: {preview}")
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
@@ -1092,10 +1113,11 @@ class AgentLoop:
                         except Exception:
                             pass
 
-                # Text content — stream it out
+                # Text content — collect now, yield only for final response
+                # (yielding intermediate text causes repeated rendering when
+                # Rich Live display interleaves with stderr progress output)
                 if chunk.delta_content:
                     collected_content += chunk.delta_content
-                    yield chunk.delta_content
 
                 # Detect error responses
                 if chunk.finish_reason == "error":
@@ -1117,6 +1139,7 @@ class AgentLoop:
             if is_final_text and not tool_calls_data:
                 # Final text response — yield it and we're done
                 if collected_content:
+                    yield collected_content
                     final_content_parts.append(collected_content)
                 break
 

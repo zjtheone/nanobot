@@ -101,7 +101,7 @@ class SubagentManager:
         )
 
         bg_task = asyncio.create_task(
-            self._run_subagent(
+            self._run_subagent_with_retry(
                 task_id=task_id,
                 task=task,
                 label=display_label,
@@ -110,6 +110,9 @@ class SubagentManager:
                 parent_session_key=session_key,
                 depth=parent_depth + 1,
                 max_depth=max_depth,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                timeout=timeout,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -127,7 +130,74 @@ class SubagentManager:
 
         depth_info = f" (depth {parent_depth + 1}/{max_depth})" if parent_depth > 0 else ""
         return f"Subagent [{display_label}]{depth_info} started (id: {task_id}). I'll notify you when it completes."
-
+    
+    async def _run_subagent_with_retry(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict,
+        session_key: str,
+        parent_session_key: str | None,
+        depth: int,
+        max_depth: int,
+        max_retries: int = 0,
+        retry_delay: float = 5.0,
+        timeout: int = 0,
+    ) -> None:
+        """运行 subagent 带重试和超时支持。"""
+        from nanobot.agent.team.errors import (
+            create_subagent_error,
+            is_retryable_error,
+            SubagentError,
+        )
+        
+        attempt = 0
+        last_error = None
+        
+        while attempt <= max_retries:
+            try:
+                if timeout > 0:
+                    await asyncio.wait_for(
+                        self._run_subagent(
+                            task_id, task, label, origin, session_key,
+                            parent_session_key, depth, max_depth,
+                        ),
+                        timeout=timeout,
+                    )
+                else:
+                    await self._run_subagent(
+                        task_id, task, label, origin, session_key,
+                        parent_session_key, depth, max_depth,
+                    )
+                return
+                
+            except asyncio.TimeoutError:
+                last_error = SubagentError(
+                    error_type="timeout",
+                    message=f"Task timed out after {timeout}s",
+                    task_id=task_id,
+                    retryable=attempt < max_retries,
+                )
+            
+            except Exception as e:
+                last_error = create_subagent_error(e, task_id=task_id)
+                if not is_retryable_error(e):
+                    break
+            
+            if attempt >= max_retries:
+                break
+            
+            delay = retry_delay * (2 ** attempt)
+            logger.warning(
+                f"Subagent [{task_id}] failed (attempt {attempt + 1}/{max_retries + 1}), "
+                f"retrying in {delay:.1f}s: {last_error.message}"
+            )
+            await asyncio.sleep(delay)
+            attempt += 1
+        
+        logger.error(f"Subagent [{task_id}] failed after {attempt} attempts: {last_error}")
+    
     async def _run_subagent(
         self,
         task_id: str,

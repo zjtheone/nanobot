@@ -345,8 +345,13 @@ def _make_provider(config):
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    multi: bool = typer.Option(False, "--multi", "-m", help="Enable multi-agent routing"),
+    interactive: bool = typer.Option(False, "--interactive", "-i", help="Enable interactive CLI mode"),
 ):
-    """Start the nanobot gateway."""
+    """Start the nanobot gateway.
+    
+    Use --multi to enable multi-agent mode with message routing based on bindings.
+    """
     from nanobot.config.loader import load_config, get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
@@ -361,16 +366,84 @@ def gateway(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-
     config = load_config()
     bus = MessageBus()
-    provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
+
+    if multi and config.agents.agent_list:
+        # Multi-agent mode
+        from nanobot.gateway.manager import MultiAgentGateway
+        
+        console.print(
+            f"{__logo__} Starting nanobot gateway in MULTI-AGENT mode on port {port}..."
+        )
+        console.print(f"[cyan]Configured agents:[/cyan] {config.agents.list_agent_ids()}")
+        console.print(f"[cyan]Default agent:[/cyan] {config.agents.default_agent}")
+        console.print(f"[cyan]Routing rules:[/cyan] {len(config.agents.bindings)}")
+        
+        gw = MultiAgentGateway(config, bus)
+        
+        async def run_multi_agent_gateway():
+            await gw.start()
+            
+            # Set cron callback for multi-agent mode
+            async def on_cron_job(job: CronJob) -> str | None:
+                """Execute a cron job through the default agent."""
+                agent = gw.get_agent(config.agents.default_agent)
+                if not agent:
+                    logger.error("Default agent not found for cron job")
+                    return None
+                response = await agent.process_direct(
+                    job.payload.message,
+                    session_key=f"cron:{job.id}",
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to or "direct",
+                )
+                if job.payload.deliver and job.payload.to:
+                    from nanobot.bus.events import OutboundMessage
+
+                    await bus.publish_outbound(
+                        OutboundMessage(
+                            channel=job.payload.channel or "cli",
+                            chat_id=job.payload.to,
+                            content=response or "",
+                        )
+                    )
+                return response
+
+            cron.on_job = on_cron_job
+            
+            # Create channels (ChannelManager doesn't need session_manager)
+            channels = ChannelManager(config, bus)
+            
+            if channels.enabled_channels:
+                console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+            
+            # Start interactive CLI if enabled
+            if interactive:
+                console.print("\n[cyan]✓[/cyan] Interactive CLI enabled")
+                interactive_task = asyncio.create_task(gw.run_interactive_cli())
+            
+            # Run until interrupted
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                await gw.stop()
+                raise
+        
+        import asyncio
+        asyncio.run(run_multi_agent_gateway())
+        return
+    
+    # Single agent mode (original behavior)
+    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    
+    provider = _make_provider(config)
 
     # Create agent with cron service
     agent = AgentLoop(
@@ -392,50 +465,6 @@ def gateway(
         thinking_budget=config.agents.defaults.thinking_budget,
         memory_search_config=config.memory_search.model_dump() if config.memory_search else None,
     )
-
-    # Set cron callback (needs agent)
-    async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
-        response = await agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
-        )
-        if job.payload.deliver and job.payload.to:
-            from nanobot.bus.events import OutboundMessage
-
-            await bus.publish_outbound(
-                OutboundMessage(
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to,
-                    content=response or "",
-                )
-            )
-        return response
-
-    cron.on_job = on_cron_job
-
-    # Create heartbeat service
-    async def on_heartbeat(prompt: str) -> str:
-        """Execute heartbeat through the agent."""
-        return await agent.process_direct(prompt, session_key="heartbeat")
-
-    heartbeat = HeartbeatService(
-        workspace=config.workspace_path,
-        on_heartbeat=on_heartbeat,
-        interval_s=30 * 60,  # 30 minutes
-        enabled=True,
-    )
-
-    # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager)
-
-    if channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
-    else:
-        console.print("[yellow]Warning: No channels enabled[/yellow]")
-
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
@@ -466,57 +495,47 @@ def gateway(
 
 
 @app.command()
-def agent(
-    message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
-    markdown: bool = typer.Option(
-        True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
-    ),
-    logs: bool = typer.Option(
-        False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"
-    ),
-    stream: bool = typer.Option(
-        True, "--stream/--no-stream", help="Stream agent output in real-time"
-    ),
-    sandbox: bool = typer.Option(False, "--sandbox", help="Enable Docker sandbox mode"),
-    max_iterations: int = typer.Option(
-        None, "--max-iterations", help="Maximum number of tool iterations"
-    ),
-    image: list[str] = typer.Option(
-        None, "--image", "-i", help="Image file path(s) for multimodal input"
-    ),
+async def agent(
 ):
     """Interact with the agent directly."""
-    from nanobot.config.loader import load_config
+    # Check if gateway mode is enabled
+    if gateway_url:
+        # Gateway mode: send messages via HTTP API
+        return await _agent_gateway_mode(
+            gateway_url=gateway_url,
+            session_id=session_id,
+            message=message,
+            markdown=markdown,
+        )
+    
+    # Local mode: create AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from loguru import logger
-
-    config = load_config()
-
+    
     bus = MessageBus()
     provider = _make_provider(config)
-
+    
     if logs:
         logger.enable("nanobot")
     else:
         logger.disable("nanobot")
-
+    
     # Tool call progress callback
     from nanobot.cli.progress import ToolProgressDisplay
-
+    
     progress = ToolProgressDisplay()
-
+    
     def _on_tool_call(name: str, args: str, result: str):
         if result.startswith("Error") or result.startswith("Tool Execution Error"):
             progress.on_tool_error(name, result)
         else:
             progress.on_tool_complete(name, result, 0)
-
+    
     # Prioritize flag, fallback to config
     use_sandbox = sandbox or config.agents.defaults.sandbox
     max_steps = max_iterations or config.agents.defaults.max_tool_iterations
-
+    
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -1171,6 +1190,51 @@ def status():
                 console.print(
                     f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
                 )
+    
+    # Check Multi-Agent Gateway status
+    console.print()
+    console.print("[bold]Multi-Agent Gateway:[/bold]")
+    
+    # Check if gateway is running by checking processes
+    import psutil
+    gateway_running = False
+    gateway_pid = None
+    
+    for proc in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            cmdline = ' '.join(proc.info['cmdline'] or [])
+            if 'nanobot' in cmdline and 'gateway' in cmdline and '--multi' in cmdline:
+                gateway_running = True
+                gateway_pid = proc.info['pid']
+                break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    
+    if gateway_running:
+        console.print(f"  Status: [green]● Running (PID: {gateway_pid})[/green]")
+        console.print(f"  Agents: {len(config.agents.agent_list)} configured")
+        console.print(f"  Default: {config.agents.default_agent}")
+        console.print(f"  Routing Rules: {len(config.agents.bindings)}")
+        console.print(f"  Teams: {len(config.agents.teams)}")
+        
+        # Show agent list
+        console.print()
+        console.print("  [bold]Configured Agents:[/bold]")
+        for agent in config.agents.agent_list:
+            marker = "👑 " if agent.id == config.agents.default_agent else "  "
+            console.print(f"    {marker}{agent.id:15} ({agent.name})")
+        
+        # Show teams
+        if config.agents.teams:
+            console.print()
+            console.print("  [bold]Teams:[/bold]")
+            for team in config.agents.teams:
+                leader_str = f" (leader: {team.leader})" if team.leader else ""
+                console.print(f"    • {team.name:20} [{team.strategy}]{leader_str}")
+                console.print(f"      Members: {', '.join(team.members)}")
+    else:
+        console.print("  Status: [dim]○ Offline[/dim]")
+        console.print("  [dim]Start with: nanobot gateway --multi[/dim]")
 
 
 if __name__ == "__main__":
@@ -1194,3 +1258,117 @@ try:
 except ImportError:
     pass
 
+# Teams CLI
+try:
+    from nanobot.cli.teams import app as teams_app
+    app.add_typer(teams_app, name="teams", help="Manage agent teams")
+except ImportError:
+    pass
+
+
+async def _agent_gateway_mode(
+    gateway_url: str,
+    session_id: str,
+    message: str | None = None,
+    markdown: bool = True,
+):
+    """Agent 模式：通过 HTTP API 连接到 Gateway。"""
+    import aiohttp
+    from rich.console import Console
+    
+    console = Console()
+    
+    # Normalize gateway URL
+    if not gateway_url.startswith('http'):
+        gateway_url = f'http://{gateway_url}'
+    
+    chat_url = f"{gateway_url.rstrip('/')}/chat"
+    
+    # Interactive chat mode if no message provided
+    if not message:
+        console.print(f"[cyan]Connected to Gateway:[/cyan] {gateway_url}")
+        console.print(f"[cyan]Session:[/cyan] {session_id}")
+        console.print("[dim]Type 'quit' or 'exit' to exit\n[/dim]")
+        
+        while True:
+            try:
+                user_input = console.input("[green]📤 You:[/green] ")
+                
+                if user_input.lower() in ['quit', 'exit', 'q']:
+                    console.print("[yellow]Goodbye![/yellow]")
+                    break
+                
+                if not user_input.strip():
+                    continue
+                
+                # Send to gateway
+                await _send_to_gateway(
+                    chat_url=chat_url,
+                    content=user_input,
+                    chat_id=session_id,
+                    console=console,
+                    markdown=markdown
+                )
+                
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[yellow]Interrupted[/yellow]")
+                break
+            except Exception as e:
+                console.print(f"[red]Error:[/red] {e}")
+    else:
+        # Single message mode
+        await _send_to_gateway(
+            chat_url=chat_url,
+            content=message,
+            chat_id=session_id,
+            console=console,
+            markdown=markdown
+        )
+
+
+async def _send_to_gateway(
+    chat_url: str,
+    content: str,
+    chat_id: str,
+    console,
+    markdown: bool = True,
+):
+    """Send message to Gateway and display response."""
+    import aiohttp
+    
+    async with aiohttp.ClientSession() as session:
+        # Show sending status
+        console.print("[dim]Sending to Gateway...[/dim]")
+        
+        try:
+            async with session.post(
+                chat_url,
+                json={
+                    'content': content,
+                    'chat_id': chat_id,
+                    'channel': 'cli',
+                    'sender_id': 'user'
+                },
+                timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    response_content = data.get('content', '')
+                    
+                    console.print("\n[cyan]🤖 Assistant:[/cyan]")
+                    if markdown:
+                        from rich.markdown import Markdown
+                        console.print(Markdown(response_content))
+                    else:
+                        console.print(response_content)
+                else:
+                    error_data = await resp.json()
+                    console.print(f"[red]Gateway Error:[/red] {error_data.get('error', 'Unknown error')}")
+        
+        except aiohttp.ClientError as e:
+            console.print(f"[red]Connection Error:[/red] {e}")
+            console.print("[dim]Make sure Gateway is running at the specified URL[/dim]")
+        except asyncio.TimeoutError:
+            console.print("[red]Timeout:[/red] Gateway did not respond in 5 minutes")
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
