@@ -40,6 +40,8 @@ class GatewayHTTPServer:
         self.app.router.add_post("/chat", self.handle_chat)
         self.app.router.add_get("/status", self.handle_status)
         self.app.router.add_get("/health", self.handle_health)
+        self.app.router.add_get("/agents", self.handle_agents)
+        self.app.router.add_get("/agents/{agent_id}", self.handle_agent_detail)
 
     async def handle_chat(self, request: web.Request) -> web.Response:
         """Handle chat message requests.
@@ -114,6 +116,25 @@ class GatewayHTTPServer:
         """Handle health check requests."""
         return web.json_response({"status": "healthy", "gateway_running": self.gateway._running})
 
+    async def handle_agents(self, request: web.Request) -> web.Response:
+        """Handle agents list with runtime status."""
+        status = self.gateway.get_status()
+        return web.json_response({
+            "agent_count": status["agent_count"],
+            "agents": status.get("agent_details", {}),
+            "a2a_registered": status.get("a2a_registered_agents", []),
+        })
+
+    async def handle_agent_detail(self, request: web.Request) -> web.Response:
+        """Handle single agent detail."""
+        agent_id = request.match_info["agent_id"]
+        agent = self.gateway.get_agent(agent_id)
+        if not agent:
+            return web.json_response({"error": f"Agent '{agent_id}' not found"}, status=404)
+        if hasattr(agent, "get_runtime_status"):
+            return web.json_response(agent.get_runtime_status())
+        return web.json_response({"agent_id": agent_id, "running": getattr(agent, "_running", False)})
+
     async def start(self):
         """Start HTTP server."""
         if not AIOHTTP_AVAILABLE:
@@ -128,9 +149,11 @@ class GatewayHTTPServer:
 
         logger.info(f"HTTP Server started at http://{self.host}:{self.port}")
         logger.info(f"Endpoints:")
-        logger.info(f"  POST /chat - Send message to gateway")
-        logger.info(f"  GET  /status - Get gateway status")
-        logger.info(f"  GET  /health - Health check")
+        logger.info(f"  POST /chat             - Send message to gateway")
+        logger.info(f"  GET  /status           - Get gateway status")
+        logger.info(f"  GET  /health           - Health check")
+        logger.info(f"  GET  /agents           - All agents runtime status")
+        logger.info(f"  GET  /agents/{{agent_id}} - Single agent detail")
 
     async def stop(self):
         """Stop HTTP server."""

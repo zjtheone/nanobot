@@ -40,12 +40,25 @@ class ConversationCompactor:
         Returns:
             Compacted message list with summary replacing old context.
         """
-        if len(messages) <= keep_recent + 2:
-            return messages  # Not enough to compact
-
-        system = messages[0]  # Always preserve system prompt
-        old = messages[1:-keep_recent]
+        # CRITICAL: Ensure tool results stay with their tool calls
+        # Find split point that keeps tool_call + tool_result pairs together
         recent = messages[-keep_recent:]
+        tool_call_ids_in_recent = {m.get("tool_call_id") for m in recent if m.get("role") == "tool"}
+        
+        # Scan backwards to find assistant messages with tool_calls referenced in recent
+        split_point = len(messages) - keep_recent
+        for i in range(len(messages) - keep_recent - 1, 0, -1):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                assistant_tool_ids = {tc.get("id") for tc in msg.get("tool_calls", [])}
+                if assistant_tool_ids & tool_call_ids_in_recent:
+                    # Must keep this assistant message to avoid orphaning tool results
+                    split_point = i
+                    break
+        
+        system = messages[0]  # Always preserve system prompt
+        old = messages[1:split_point]
+        kept_recent = messages[split_point:]
 
         if not old:
             return messages
@@ -65,7 +78,7 @@ class ConversationCompactor:
             "content": f"[Conversation summary — earlier messages were compacted]\n\n{summary}",
         }
 
-        compacted = [system, summary_msg] + recent
+        compacted = [system, summary_msg] + kept_recent
         old_chars = sum(len(str(m.get("content", ""))) for m in messages)
         new_chars = sum(len(str(m.get("content", ""))) for m in compacted)
         logger.info(f"Compacted conversation: {old_chars} -> {new_chars} chars ({len(old)} messages summarized)")

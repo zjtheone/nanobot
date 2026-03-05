@@ -86,6 +86,13 @@ class MultiAgentGateway:
 
         # 4. 订阅 bus 消息
         self._message_task = asyncio.create_task(self._message_dispatcher())
+
+        # 5. 启动 A2A mailbox 轮询（让每个 agent 能接收来自其他 agent 的请求）
+        self._a2a_poll_tasks: dict[str, asyncio.Task] = {}
+        for agent_id, agent in self.agents.items():
+            task = asyncio.create_task(self._a2a_poll_loop(agent_id, agent))
+            self._a2a_poll_tasks[agent_id] = task
+        logger.info(f"Started A2A mailbox polling for {len(self._a2a_poll_tasks)} agents")
         
         # 记录启动时间
         self._start_time = asyncio.get_event_loop().time()
@@ -155,7 +162,16 @@ class MultiAgentGateway:
 
         # Close A2A router
         await self.a2a_router.close()
-        
+
+        # Stop A2A poll tasks
+        for task in getattr(self, '_a2a_poll_tasks', {}).values():
+            task.cancel()
+        for task in getattr(self, '_a2a_poll_tasks', {}).values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
         # Stop message dispatcher
         if hasattr(self, "_message_task"):
             self._message_task.cancel()
@@ -177,10 +193,21 @@ class MultiAgentGateway:
         logger.info("MultiAgentGateway stopped")
     
     def get_status(self) -> dict:
-        """获取 gateway 和所有 agent 的状态。"""
+        """获取 gateway 和所有 agent 的状态（含运行时详情）。"""
         uptime = 0
         if self._start_time and self._running:
             uptime = asyncio.get_event_loop().time() - self._start_time
+
+        # 收集每个 agent 的运行时状态
+        agent_details = {}
+        for agent_id, agent in self.agents.items():
+            if hasattr(agent, "get_runtime_status"):
+                agent_details[agent_id] = agent.get_runtime_status()
+            else:
+                agent_details[agent_id] = {"agent_id": agent_id, "running": getattr(agent, "_running", False)}
+
+        # A2A 路由器摘要
+        a2a_registered = list(self.a2a_router._mailboxes.keys()) if self.a2a_router else []
 
         return {
             "status": "running" if self._running else "stopped",
@@ -188,10 +215,12 @@ class MultiAgentGateway:
             "uptime_human": self._format_uptime(uptime) if uptime > 0 else "0s",
             "agent_count": len(self.agents),
             "agents": list(self.agents.keys()),
+            "agent_details": agent_details,
             "default_agent": self.config.agents.default_agent,
             "routing_rules": len(self.router.bindings),
             "teams": len(self.config.agents.teams),
             "team_names": [t.name for t in self.config.agents.teams],
+            "a2a_registered_agents": a2a_registered,
         }
 
     def _format_uptime(self, seconds: float) -> str:
@@ -254,6 +283,25 @@ class MultiAgentGateway:
         except Exception as e:
             logger.error(f"Error processing message in agent {agent_id}: {e}", exc_info=True)
 
+    async def _a2a_poll_loop(self, agent_id: str, agent: AgentLoop) -> None:
+        """Continuously poll A2A mailbox for an agent and process incoming requests.
+
+        This is essential in gateway mode where agents don't run their own event loop.
+        When another agent sends an A2A request, this loop picks it up, lets the target
+        agent process it, and sends the response back via the router.
+        """
+        logger.debug(f"A2A poll loop started for agent {agent_id}")
+        while self._running:
+            try:
+                await agent._poll_a2a_mailbox()
+                await asyncio.sleep(0.1)  # Avoid busy loop
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"A2A poll error for {agent_id}: {e}")
+                await asyncio.sleep(1)
+        logger.debug(f"A2A poll loop stopped for agent {agent_id}")
+
     def _create_agent_loop(self, agent_config: AgentConfig) -> AgentLoop:
         """根据 AgentConfig 创建 AgentLoop 实例。
         
@@ -293,6 +341,7 @@ class MultiAgentGateway:
             bus=self.bus,
             provider=provider,
             workspace=workspace,
+            agent_id=agent_config.id,
             model=model,
             max_iterations=agent_config.max_tool_iterations,
             max_tokens=agent_config.max_tokens,

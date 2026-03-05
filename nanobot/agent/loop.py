@@ -123,6 +123,9 @@ class AgentLoop:
         
         # Store agents config for Broadcast tool
         self._agents_config = agents_config
+
+        # Build role-specific system prompt suffix (for orchestrator, etc.)
+        self._role_prompt = self._build_role_prompt()
         self._mcp_connected = False
         self._mcp_connecting = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
@@ -192,6 +195,7 @@ class AgentLoop:
         self.announce_chain = AnnounceChainManager()
 
         self._running = False
+        self._processing = False  # True while actively processing a message
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -424,6 +428,79 @@ class AgentLoop:
             if hasattr(self, "checkpoint"):
                 self.checkpoint.cleanup()
 
+    def _build_role_prompt(self) -> str:
+        """Build role-specific prompt based on agent_id and available team tools."""
+        parts = []
+
+        # Orchestrator role
+        if self.agent_id == "orchestrator":
+            from nanobot.agent.team.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT
+            parts.append(ORCHESTRATOR_SYSTEM_PROMPT)
+
+        # Team awareness: if teams are configured, tell the agent about them
+        if self._agents_config and self._agents_config.teams:
+            team_info = []
+            for t in self._agents_config.teams:
+                members_str = ", ".join(t.members)
+                leader_str = f", leader={t.leader}" if t.leader else ""
+                team_info.append(f"  - {t.name}: [{members_str}] strategy={t.strategy}{leader_str}")
+            parts.append(
+                "## Available Teams\n"
+                "You can use the `team_task` tool to dispatch tasks to these teams:\n"
+                + "\n".join(team_info)
+                + "\n\nFor complex tasks, prefer delegating to teams rather than doing everything yourself."
+            )
+
+        return "\n\n".join(parts)
+
+    def _inject_role_prompt(self, messages: list[dict]) -> list[dict]:
+        """Inject role-specific prompt into the system message."""
+        if not self._role_prompt or not messages:
+            return messages
+        if messages[0].get("role") == "system":
+            messages[0] = {
+                **messages[0],
+                "content": messages[0]["content"] + "\n\n" + self._role_prompt,
+            }
+        return messages
+
+    def get_runtime_status(self) -> dict:
+        """Return runtime status of this agent.
+
+        Includes: running state, subagent count, A2A mailbox depth,
+        registered tools, and announce chain children.
+        """
+        # A2A mailbox depth
+        mailbox_depth = 0
+        if self.a2a_router:
+            mailbox = self.a2a_router.get_mailbox(self.agent_id)
+            if mailbox:
+                mailbox_depth = mailbox.queue.qsize()
+
+        # Subagent info
+        subagent_count = 0
+        if hasattr(self, "subagents"):
+            subagent_count = self.subagents.get_running_count()
+
+        # Registered tools
+        tool_names = []
+        if hasattr(self, "tools"):
+            tool_names = self.tools.tool_names
+
+        # Agent is "ready" if it has been registered with A2A router (gateway mode)
+        # or if _running is True (standalone loop mode)
+        is_ready = self._running or (self.a2a_router is not None)
+
+        return {
+            "agent_id": self.agent_id,
+            "ready": is_ready,
+            "processing": self._processing,
+            "model": self.model,
+            "subagent_count": subagent_count,
+            "a2a_mailbox_depth": mailbox_depth,
+            "tools": tool_names,
+        }
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -471,6 +548,19 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
+        self._processing = True
+        try:
+            return await self._process_message_inner(msg, session_key, on_progress)
+        finally:
+            self._processing = False
+
+    async def _process_message_inner(
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Inner message processing logic."""
         # Get session key first
         key = session_key or msg.session_key
         
@@ -542,6 +632,7 @@ class AgentLoop:
             chat_id=msg.chat_id,
             plan_context=self.planner.get_progress_context(),
         )
+        messages = self._inject_role_prompt(messages)
 
         # Agent loop
         iteration = 0
@@ -574,6 +665,13 @@ class AgentLoop:
                     pass
 
             # Call LLM
+            logger.info(
+                "[{}] Calling LLM (model={}, msgs={}, tools={})",
+                self.agent_id,
+                self.model,
+                len(messages),
+                len(self.tools.get_definitions()),
+            )
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
@@ -583,6 +681,7 @@ class AgentLoop:
                 frequency_penalty=self.frequency_penalty,
                 thinking_budget=self.thinking_budget,
             )
+            logger.info("[{}] LLM responded (iter {})", self.agent_id, iteration)
 
             # Track token usage
             if response.usage:
@@ -740,6 +839,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
+        messages = self._inject_role_prompt(messages)
 
         # Agent loop (limited for announce handling)
         iteration = 0
@@ -918,9 +1018,26 @@ class AgentLoop:
         if len(messages) <= keep_tail + 1:
             return messages  # Not enough to trim
 
-        trimmed = [messages[0]]  # system prompt
-        middle = messages[1:-keep_tail]
+        # CRITICAL: Ensure tool results stay with their tool calls
+        # Find the earliest assistant message with tool_calls that corresponds to tool results in the tail
         tail = messages[-keep_tail:]
+        tool_call_ids_in_tail = {m.get("tool_call_id") for m in tail if m.get("role") == "tool"}
+        
+        # Scan backwards from tail to find all assistant messages with matching tool_calls
+        split_point = len(messages) - keep_tail
+        for i in range(len(messages) - keep_tail - 1, 0, -1):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Check if any tool_call IDs match tool results in tail
+                assistant_tool_ids = {tc.get("id") for tc in msg.get("tool_calls", [])}
+                if assistant_tool_ids & tool_call_ids_in_tail:
+                    # This assistant message has tool calls referenced in tail - must keep it
+                    split_point = i
+                    break
+
+        trimmed = [messages[0]]  # system prompt
+        middle = messages[1:split_point]
+        kept_tail = messages[split_point:]
 
         for msg in middle:
             if msg.get("role") == "tool":
@@ -939,7 +1056,7 @@ class AgentLoop:
                     }
             trimmed.append(msg)
 
-        trimmed.extend(tail)
+        trimmed.extend(kept_tail)
         new_chars = sum(len(str(m.get("content", ""))) for m in trimmed)
         logger.info(f"Context trimmed: {total_chars} -> {new_chars} chars")
 
@@ -1098,6 +1215,7 @@ class AgentLoop:
             chat_id=chat_id,
             plan_context=self.planner.get_progress_context(),
         )
+        messages = self._inject_role_prompt(messages)
 
         iteration = 0
         final_content_parts: list[str] = []
