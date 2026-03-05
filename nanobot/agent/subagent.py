@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage
+from nanobot.agent.announce_chain import AnnounceChainManager, AnnounceEvent, AnnounceType
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.tools.registry import ToolRegistry
@@ -131,6 +132,31 @@ class SubagentManager:
         depth_info = f" (depth {parent_depth + 1}/{max_depth})" if parent_depth > 0 else ""
         return f"Subagent [{display_label}]{depth_info} started (id: {task_id}). I'll notify you when it completes."
     
+
+    async def _publish_announce_via_bus(self, task_id, label, result, status, parent_session_key):
+        """Publish announce event via MessageBus."""
+        from nanobot.bus.events import OutboundMessage
+        from loguru import logger
+        
+        announce_msg = OutboundMessage(
+            channel="system",
+            chat_id="announce",
+            content=f"ANNOUNCE|{task_id}|{label}|{status}|{result[:500]}",
+            metadata={
+                "type": "announce",
+                "task_id": task_id,
+                "label": label,
+                "status": status,
+                "parent_session": parent_session_key,
+            }
+        )
+        
+        try:
+            await self.bus.publish_outbound(announce_msg)
+            logger.debug("Published announce for task {}", task_id)
+        except Exception as e:
+            logger.error("Failed to publish announce: {}", e)
+
     async def _run_subagent_with_retry(
         self,
         task_id: str,

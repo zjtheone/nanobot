@@ -27,6 +27,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.orchestrator import DecomposeAndSpawnTool, AggregateResultsTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
@@ -53,6 +54,7 @@ class AgentLoop:
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        agent_id: str = "default",  # Agent identifier
         model: str | None = None,
         max_iterations: int = 20,
         max_tokens: int = 8192,
@@ -86,6 +88,7 @@ class AgentLoop:
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
+        self.agent_id = agent_id  # Agent identifier for A2A and Orchestrator
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
@@ -320,6 +323,15 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+        
+        # Orchestrator tools (for task decomposition)
+        if self.agent_id == "orchestrator":
+            decompose_tool = DecomposeAndSpawnTool(self)
+            self.tools.register(decompose_tool)
+            
+            aggregate_tool = AggregateResultsTool(self)
+            self.tools.register(aggregate_tool)
+            logger.info("Registered Orchestrator tools for agent {}", self.agent_id)
         
         # Broadcast tool (for team communication)
         if self._agents_config:
@@ -1439,3 +1451,257 @@ Respond with ONLY valid JSON, no markdown fences."""
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
+
+    # ==========================================================================
+    # A2A (Agent-to-Agent) Communication Methods
+    # ==========================================================================
+    
+    async def send_request(
+        self,
+        to_agent: str,
+        content: str,
+        timeout: int = 300,
+        priority: str = "normal",
+    ) -> AgentMessage:
+        """
+        Send request to another agent and wait for response.
+        
+        Args:
+            to_agent: Target agent ID
+            content: Request content
+            timeout: Timeout in seconds
+            priority: Message priority ("low", "normal", "high", "urgent")
+        
+        Returns:
+            Response message
+        
+        Raises:
+            ValueError: If A2A router not initialized or target agent not found
+            asyncio.TimeoutError: If request timed out
+        """
+        if not self.a2a_router:
+            raise ValueError("A2A router not initialized")
+        
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT,
+        }
+        
+        return await self.a2a_router.send_request(
+            from_agent=self.agent_id,
+            to_agent=to_agent,
+            content=content,
+            timeout=timeout,
+            priority=priority_map.get(priority, MessagePriority.NORMAL),
+        )
+    
+    async def send_response(
+        self,
+        request_id: str,
+        to_agent: str,
+        content: str,
+        priority: str = "normal",
+    ) -> bool:
+        """
+        Send response to a request.
+        
+        Args:
+            request_id: Original request ID
+            to_agent: Original requester agent ID
+            content: Response content
+            priority: Message priority
+        
+        Returns:
+            True if response was sent
+        """
+        if not self.a2a_router:
+            raise ValueError("A2A router not initialized")
+        
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT,
+        }
+        
+        return await self.a2a_router.send_response(
+            from_agent=self.agent_id,
+            to_agent=to_agent,
+            request_id=request_id,
+            content=content,
+            priority=priority_map.get(priority, MessagePriority.NORMAL),
+        )
+    
+    async def send_notification(
+        self,
+        to_agent: str,
+        content: str,
+        priority: str = "normal",
+    ) -> bool:
+        """
+        Send notification to another agent (no response expected).
+        
+        Args:
+            to_agent: Target agent ID
+            content: Notification content
+            priority: Message priority
+        
+        Returns:
+            True if notification was sent
+        """
+        if not self.a2a_router:
+            raise ValueError("A2A router not initialized")
+        
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT,
+        }
+        
+        return await self.a2a_router.send_notification(
+            from_agent=self.agent_id,
+            to_agent=to_agent,
+            content=content,
+            priority=priority_map.get(priority, MessagePriority.NORMAL),
+        )
+    
+    async def broadcast(
+        self,
+        content: str,
+        priority: str = "normal",
+        exclude: list[str] | None = None,
+    ) -> int:
+        """
+        Broadcast message to all agents.
+        
+        Args:
+            content: Broadcast content
+            priority: Message priority
+            exclude: List of agent IDs to exclude
+        
+        Returns:
+            Number of agents that received the broadcast
+        """
+        if not self.a2a_router:
+            raise ValueError("A2A router not initialized")
+        
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT,
+        }
+        
+        return await self.a2a_router.broadcast(
+            from_agent=self.agent_id,
+            content=content,
+            priority=priority_map.get(priority, MessagePriority.NORMAL),
+            exclude=exclude,
+        )
+    
+    async def receive_message(
+        self,
+        timeout: float | None = None,
+    ) -> AgentMessage:
+        """
+        Receive next message from mailbox.
+        
+        Args:
+            timeout: Maximum time to wait (None = wait forever)
+        
+        Returns:
+            Next agent message
+        
+        Raises:
+            ValueError: If A2A router not initialized
+            asyncio.TimeoutError: If timeout exceeded
+        """
+        if not self.a2a_router:
+            raise ValueError("A2A router not initialized")
+        
+        return await self.a2a_router.get_message(
+            agent_id=self.agent_id,
+            timeout=timeout,
+        )
+
+    # ==========================================================================
+    # AnnounceChain Methods (for Orchestrator pattern)
+    # ==========================================================================
+    
+    async def wait_for_workers(
+        self,
+        timeout: float = 600,
+        poll_interval: float = 1.0,
+    ) -> dict | None:
+        """
+        Wait for all spawned workers to complete and aggregate results.
+        
+        This is the key method for Orchestrator pattern:
+        1. Orchestrator spawns workers
+        2. Workers complete and send announce events
+        3. This method waits and aggregates all results
+        
+        Args:
+            timeout: Maximum time to wait (seconds)
+            poll_interval: Polling interval (seconds)
+        
+        Returns:
+            Aggregated results from all workers, or None if timeout
+        """
+        from loguru import logger
+        
+        # Get current session key
+        # For Orchestrator, we use a session key pattern like "orchestrator:<task_id>"
+        # Workers will have parent_session_key pointing to this
+        
+        # Find all child sessions for this agent
+        current_session_key = f"{self.agent_id}:current"  # Simplified for now
+        
+        logger.info(
+            "Orchestrator waiting for workers (timeout: {}s)...",
+            timeout,
+        )
+        
+        # Wait for children
+        result = await self.announce_chain.wait_for_children(
+            parent_session_key=current_session_key,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+        
+        if result:
+            logger.info(
+                "All {} workers completed, aggregating results...",
+                len(result.children),
+            )
+            return {
+                "success": True,
+                "worker_count": len(result.children),
+                "results": [child.to_dict() for child in result.children],
+                "summary": result.get_summary(),
+            }
+        else:
+            logger.warning("Timeout waiting for workers")
+            return {
+                "success": False,
+                "error": f"Timeout after {timeout}s",
+                "worker_count": 0,
+                "results": [],
+            }
+    
+    def get_worker_results(self) -> list:
+        """
+        Get results from completed workers.
+        
+        Returns:
+            List of worker results
+        """
+        current_session_key = f"{self.agent_id}:current"
+        aggregation = self.announce_chain.get_aggregation(current_session_key)
+        
+        if aggregation:
+            return [child.to_dict() for child in aggregation.children]
+        return []
