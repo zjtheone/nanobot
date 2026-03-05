@@ -436,11 +436,14 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
+        # Get session key first
+        key = session_key or msg.session_key
+        
+        # Extract agent_id from session key for logging
         agent_id = key.split(":")[0] if key and ":" in key else "unknown"
+        
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"🤖 [{agent_id}] Processing: {preview}")
-
-        key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
         # Handle slash commands
@@ -735,9 +738,13 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
 
+                # Get current session for agent_id
+                current_session_key = list(self.sessions._cache.keys())[-1] if self.sessions._cache else None
+                agent_id = current_session_key.split(":")[0] if current_session_key and ":" in current_session_key else "unknown"
+                
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    logger.info(f"🔄 [{agent_id}] Tool call: {tool_call.name}({args_str[:150]}...)")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -821,8 +828,12 @@ class AgentLoop:
         """Execute a single tool with hooks and metrics tracking."""
         from nanobot.agent.hooks import HookContext
 
+        # Get current session for agent_id
+        current_session_key = list(self.sessions._cache.keys())[-1] if self.sessions._cache else None
+        agent_id = current_session_key.split(":")[0] if current_session_key and ":" in current_session_key else "unknown"
+
         args_str = json.dumps(arguments, ensure_ascii=False)
-        logger.info(f"Tool call: {name}({args_str[:200]})")
+        logger.info(f"🔄 [{agent_id}] Tool call: {name}({args_str[:150]}...)")
 
         # Pre-hooks
         ctx = HookContext(tool_name=name, params=arguments)
