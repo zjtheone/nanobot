@@ -157,8 +157,35 @@ class BroadcastTool(Tool):
         message: str,
         timeout: int,
     ) -> str:
-        """Spawn a single agent for the broadcast task."""
-        # Use manager.spawn with timeout
+        """Send task to a single agent and wait for result.
+
+        Prefers A2A router (real-time response) over SubagentManager.spawn()
+        (fire-and-forget).
+        """
+        # Try A2A router first — returns actual execution result
+        a2a_router = getattr(self._manager, '_a2a_router', None)
+        if not a2a_router:
+            # Check if agent_loop has a2a_router
+            agent_loop = getattr(self, '_agent_loop', None)
+            if agent_loop:
+                a2a_router = getattr(agent_loop, 'a2a_router', None)
+
+        if a2a_router and a2a_router.get_mailbox(agent_id):
+            import asyncio
+            try:
+                resp = await a2a_router.send_request(
+                    from_agent=self._agent_id,
+                    to_agent=agent_id,
+                    content=message,
+                    timeout=timeout,
+                )
+                return resp.content
+            except asyncio.TimeoutError:
+                return f"Timeout after {timeout}s"
+            except Exception as e:
+                return f"A2A error: {e}"
+
+        # Fallback to spawn (fire-and-forget)
         result = await self._manager.spawn(
             task=message,
             label=f"broadcast:{agent_id}",

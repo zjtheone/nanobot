@@ -28,6 +28,7 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.orchestrator import DecomposeAndSpawnTool, AggregateResultsTool
+from nanobot.agent.tools.team_task import TeamTaskTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
@@ -35,6 +36,10 @@ from nanobot.session.manager import Session, SessionManager
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig, AgentsConfig
     from nanobot.cron.service import CronService
+    from nanobot.agent.a2a.router import A2ARouter
+
+from nanobot.agent.a2a.types import AgentMessage, MessagePriority, MessageType
+from nanobot.agent.announce_chain import AnnounceChainManager
 
 
 class AgentLoop:
@@ -179,6 +184,12 @@ class AgentLoop:
         from nanobot.mcp.registry import MCPManager
 
         self.mcp_manager = MCPManager()
+
+        # A2A router (set externally by MultiAgentGateway for shared routing)
+        self.a2a_router: "A2ARouter | None" = None
+
+        # Announce chain for hierarchical result aggregation
+        self.announce_chain = AnnounceChainManager()
 
         self._running = False
         self._register_default_tools()
@@ -340,6 +351,7 @@ class AgentLoop:
                 manager=self.subagents,
                 agents_config=self._agents_config,
             )
+            broadcast_tool._agent_loop = self  # inject for A2A access
             # Set context for broadcast tool
             broadcast_tool.set_context(
                 channel="cli",
@@ -349,6 +361,15 @@ class AgentLoop:
             )
             self.tools.register(broadcast_tool)
 
+        # Team task tool (for triggering team collaboration via A2A)
+        if self._agents_config:
+            team_tool = TeamTaskTool(self)
+            self.tools.register(team_tool)
+        else:
+            logger.debug(
+                "[{}] No agents_config — team_task tool not registered",
+                self.agent_id,
+            )
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -356,7 +377,7 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
-        logger.info("Agent loop started")
+        logger.info("Agent loop started (agent_id={})", self.agent_id)
 
         # Start MCP servers and register their tools
         await self._start_mcp_servers()
@@ -383,6 +404,8 @@ class AgentLoop:
                             )
                         )
                 except asyncio.TimeoutError:
+                    # Poll A2A mailbox during idle time
+                    await self._poll_a2a_mailbox()
                     continue
         finally:
             if hasattr(self, "lsp_manager"):
@@ -1451,6 +1474,74 @@ Respond with ONLY valid JSON, no markdown fences."""
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
+
+    # ==========================================================================
+    # A2A Mailbox Polling (integrated into main loop)
+    # ==========================================================================
+
+    async def _poll_a2a_mailbox(self) -> None:
+        """Poll A2A mailbox for incoming messages and process them.
+
+        Called during idle time in the main loop when no bus messages arrive.
+        Converts A2A messages into InboundMessages for processing.
+        """
+        if not self.a2a_router:
+            return
+
+        mailbox = self.a2a_router.get_mailbox(self.agent_id)
+        if not mailbox or mailbox.queue.empty():
+            return
+
+        try:
+            a2a_msg = await mailbox.queue.get(timeout=0.05)
+        except (asyncio.TimeoutError, RuntimeError):
+            return
+
+        logger.info(
+            "[{}] Received A2A {} from {}",
+            self.agent_id,
+            a2a_msg.type.value,
+            a2a_msg.from_agent,
+        )
+
+        # Convert A2A message to InboundMessage for processing
+        content = a2a_msg.content
+        if a2a_msg.type == MessageType.REQUEST:
+            content = (
+                f"[A2A Request from {a2a_msg.from_agent} "
+                f"(id={a2a_msg.message_id})]\n{content}"
+            )
+
+        inbound = InboundMessage(
+            channel="a2a",
+            chat_id=a2a_msg.from_agent,
+            content=content,
+            sender_id=a2a_msg.from_agent,
+            metadata={
+                "a2a_message_id": a2a_msg.message_id,
+                "a2a_type": a2a_msg.type.value,
+                "a2a_from": a2a_msg.from_agent,
+                "a2a_request_id": a2a_msg.request_id,
+            },
+        )
+
+        response = await self._process_message(inbound)
+
+        # If it was a request, send back a response via A2A
+        if response and a2a_msg.type == MessageType.REQUEST:
+            try:
+                await self.a2a_router.send_response(
+                    from_agent=self.agent_id,
+                    to_agent=a2a_msg.from_agent,
+                    request_id=a2a_msg.message_id,
+                    content=response.content,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to send A2A response to {}: {}",
+                    a2a_msg.from_agent,
+                    e,
+                )
 
     # ==========================================================================
     # A2A (Agent-to-Agent) Communication Methods

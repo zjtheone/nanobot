@@ -129,6 +129,16 @@ class DecomposeAndSpawnTool(Tool):
         spawn_tool = SpawnTool(
             manager=self.agent_loop.subagents if hasattr(self.agent_loop, 'subagents') else None,
         )
+
+        # Set context from agent_loop so spawn has proper session/agent info
+        if hasattr(self.agent_loop, 'agent_id'):
+            spawn_tool.set_context(
+                channel="orchestrator",
+                chat_id="decompose",
+                session_key=getattr(self.agent_loop, '_current_session_key', None),
+                agent_id=self.agent_loop.agent_id,
+                spawn_depth=0,
+            )
         
         # Spawn all workers in batch
         batch_tasks = [
@@ -141,18 +151,42 @@ class DecomposeAndSpawnTool(Tool):
             wait=True,
             timeout=timeout,
         )
-        
-        logger.info("All workers spawned, result: {}", spawn_result[:200])
-        
-        # Wait for workers to complete and aggregate results
-        # (This would use wait_for_workers when announce_chain is fully integrated)
-        return {
-            "success": True,
-            "task": task,
-            "worker_count": len(workers),
-            "spawn_result": spawn_result,
-            "note": "Results will be available via wait_for_workers() when announce_chain is fully integrated",
-        }
+
+        logger.info("All workers spawned, waiting for results...")
+
+        # Wait for workers to complete via announce_chain
+        session_key = getattr(self.agent_loop, '_current_session_key', None)
+        if not session_key:
+            session_key = f"{self.agent_loop.agent_id}:current"
+
+        aggregation = await self.agent_loop.announce_chain.wait_for_children(
+            parent_session_key=session_key,
+            timeout=timeout,
+            poll_interval=1.0,
+        )
+
+        if aggregation:
+            logger.info(
+                "All {} workers completed, aggregating results",
+                len(aggregation.children),
+            )
+            return {
+                "success": True,
+                "task": task,
+                "worker_count": len(aggregation.children),
+                "results": [child.to_dict() for child in aggregation.children],
+                "summary": aggregation.get_summary(),
+            }
+        else:
+            # Timeout — return partial results from spawn
+            logger.warning("Timeout waiting for workers after {}s", timeout)
+            return {
+                "success": False,
+                "task": task,
+                "worker_count": len(workers),
+                "spawn_result": spawn_result,
+                "error": f"Timeout after {timeout}s waiting for workers",
+            }
 
 
 class AggregateResultsTool(Tool):

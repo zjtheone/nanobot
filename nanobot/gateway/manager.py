@@ -12,6 +12,7 @@ from nanobot.config.schema import Config, AgentConfig
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.a2a.router import A2ARouter
 from nanobot.gateway.router import MessageRouter
 from nanobot.gateway.http_server import GatewayHTTPServer
 
@@ -37,6 +38,9 @@ class MultiAgentGateway:
         self.router = MessageRouter(
             bindings=config.agents.bindings, default_agent=config.agents.default_agent
         )
+
+        # 创建共享 A2A 路由器（所有 agent 共用）
+        self.a2a_router = A2ARouter()
 
         logger.info(
             f"MultiAgentGateway initialized with {len(config.agents.agent_list)} agents, "
@@ -148,6 +152,9 @@ class MultiAgentGateway:
         # Stop HTTP Server
         if self._http_server:
             await self._http_server.stop()
+
+        # Close A2A router
+        await self.a2a_router.close()
         
         # Stop message dispatcher
         if hasattr(self, "_message_task"):
@@ -171,33 +178,10 @@ class MultiAgentGateway:
     
     def get_status(self) -> dict:
         """获取 gateway 和所有 agent 的状态。"""
-        import time
-        
         uptime = 0
         if self._start_time and self._running:
             uptime = asyncio.get_event_loop().time() - self._start_time
-        
-        return {
-            "status": "running" if self._running else "stopped",
-            "uptime": uptime,
-            "uptime_human": self._format_uptime(uptime),
-            "agent_count": len(self.agents),
-            "agents": list(self.agents.keys()),
-            "default_agent": self.config.agents.default_agent,
-            "routing_rules": len(self.router.bindings),
-            "teams": len(self.config.agents.teams),
-            "team_names": [t.name for t in self.config.agents.teams],
-        }
-    
 
-    def get_status(self) -> dict:
-        """Get status of gateway and all agents."""
-        import time
-        
-        uptime = 0
-        if self._start_time and self._running:
-            uptime = asyncio.get_event_loop().time() - self._start_time
-        
         return {
             "status": "running" if self._running else "stopped",
             "uptime": uptime,
@@ -207,8 +191,9 @@ class MultiAgentGateway:
             "default_agent": self.config.agents.default_agent,
             "routing_rules": len(self.router.bindings),
             "teams": len(self.config.agents.teams),
+            "team_names": [t.name for t in self.config.agents.teams],
         }
-    
+
     def _format_uptime(self, seconds: float) -> str:
         """格式化运行时间。"""
         if seconds < 60:
@@ -325,6 +310,11 @@ class MultiAgentGateway:
         )
         
         self.agents[agent_config.id] = agent
+
+        # 注入共享 A2A 路由器并注册 agent 的 mailbox
+        agent.a2a_router = self.a2a_router
+        self.a2a_router.register_agent(agent_config.id, agent)
+
         return agent
 
     async def health_check(self) -> dict[str, str]:

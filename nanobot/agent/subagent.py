@@ -65,6 +65,9 @@ class SubagentManager:
         target_agent_id: str | None = None,
         parent_depth: int = 0,
         max_depth: int = 1,
+        max_retries: int = 0,
+        retry_delay: float = 5.0,
+        timeout: int = 0,
     ) -> str:
         """Spawn a subagent to execute a task in the background.
 
@@ -262,7 +265,6 @@ class SubagentManager:
                     working_dir=str(self.workspace),
                     timeout=self.exec_config.timeout,
                     restrict_to_workspace=self.restrict_to_workspace,
-                    path_append=self.exec_config.path_append,
                 )
             )
             tools.register(WebSearchTool(api_key=self.brave_api_key))
