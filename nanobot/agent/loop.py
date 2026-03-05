@@ -605,6 +605,7 @@ class AgentLoop:
             async def _consolidate_and_unlock():
                 try:
                     await self._consolidate_memory(session)
+                    self.sessions.save(session)  # Persist pruned session to disk
                 finally:
                     self._consolidating.discard(session.key)
 
@@ -1552,12 +1553,15 @@ Respond with ONLY valid JSON, no markdown fences."""
             if archive_all:
                 session.last_consolidated = 0
             else:
-                session.last_consolidated = len(session.messages) - keep_count
-            logger.info(
-                "Memory consolidation done: {} messages, last_consolidated={}",
-                len(session.messages),
-                session.last_consolidated,
-            )
+                # Prune consolidated messages to prevent unbounded growth
+                old_len = len(session.messages)
+                session.messages = session.messages[-keep_count:]
+                session.last_consolidated = 0
+                logger.info(
+                    "Memory consolidation done: pruned {} -> {} messages",
+                    old_len,
+                    len(session.messages),
+                )
         except Exception as e:
             logger.error("Memory consolidation failed: {}", e)
 

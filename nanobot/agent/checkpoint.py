@@ -28,11 +28,14 @@ class CheckpointManager:
     If something goes wrong, rollback() restores the file.
     """
 
+    MAX_CHECKPOINTS_PER_FILE = 3  # Only keep last N checkpoints per file
+
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self._store = workspace / ".nanobot" / "checkpoints"
         self._store.mkdir(parents=True, exist_ok=True)
         self._changes: dict[str, list[FileChange]] = {}  # path -> [changes]
+        self._cleanup_orphans()
 
     def snapshot(self, path: Path) -> str:
         """
@@ -71,7 +74,16 @@ class CheckpointManager:
             original_hash=original_hash,
         )
 
-        self._changes.setdefault(key, []).append(change)
+        changes = self._changes.setdefault(key, [])
+        changes.append(change)
+
+        # Evict oldest checkpoints if over limit
+        while len(changes) > self.MAX_CHECKPOINTS_PER_FILE:
+            old = changes.pop(0)
+            bp = Path(old.backup_path)
+            if bp.exists():
+                bp.unlink()
+
         logger.debug(f"Checkpoint {checkpoint_id} for {resolved.name}")
         return checkpoint_id
 
@@ -206,6 +218,19 @@ class CheckpointManager:
             if changes:
                 result.append(changes[-1])
         return sorted(result, key=lambda c: c.timestamp)
+
+    def _cleanup_orphans(self) -> None:
+        """Remove orphaned checkpoint files left by previous abnormal exits."""
+        try:
+            count = 0
+            for f in self._store.iterdir():
+                if f.is_file():
+                    f.unlink()
+                    count += 1
+            if count:
+                logger.info(f"Cleaned up {count} orphaned checkpoint files")
+        except Exception:
+            pass
 
     def cleanup(self) -> None:
         """Remove all checkpoint backup files."""

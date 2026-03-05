@@ -98,7 +98,7 @@ class A2ARouter:
         from_agent: str,
         to_agent: str,
         content: str,
-        timeout: int = 300,
+        timeout: int = 1800,
         priority: MessagePriority = MessagePriority.NORMAL,
     ) -> AgentMessage:
         """

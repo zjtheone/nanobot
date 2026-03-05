@@ -29,22 +29,23 @@ class DecomposeAndSpawnTool(Tool):
             "**Orchestrator's primary tool** - Decompose a complex task and dispatch workers in parallel.\n\n"
             "This tool:\n"
             "1. Sends subtasks to worker agents via A2A communication\n"
-            "2. Waits for all workers to complete\n"
+            "2. Waits for all workers to complete (in parallel)\n"
             "3. Aggregates results from all workers\n\n"
+            "**IMPORTANT: Do NOT specify agent_id** — workers are auto-distributed across available agents "
+            "for maximum parallelism. Only specify agent_id if a task strictly requires a specific agent.\n\n"
             "**Parameters:**\n"
             "- `task`: Main task description\n"
-            "- `workers`: List of {label, task, agent_id (optional)} for each worker\n"
-            "- `timeout`: Timeout in seconds (default: 600)\n\n"
-            "If `agent_id` is not specified for a worker, it will be assigned to the first available agent.\n\n"
+            "- `workers`: List of {label, task} for each worker. Do NOT include agent_id.\n"
+            "- `timeout`: Timeout in seconds (default: 1800, do NOT override unless needed)\n\n"
             "**Example:**\n"
             "```json\n"
             "{\n"
             '  "task": "Build an e-commerce site",\n'
             '  "workers": [\n'
-            '    {"label": "backend", "task": "Implement API", "agent_id": "coding"},\n'
-            '    {"label": "frontend", "task": "Implement UI", "agent_id": "coding"}\n'
-            '  ],\n'
-            '  "timeout": 600\n'
+            '    {"label": "backend", "task": "Implement API"},\n'
+            '    {"label": "frontend", "task": "Implement UI"},\n'
+            '    {"label": "database", "task": "Design schema"}\n'
+            '  ]\n'
             "}\n"
             "```"
         )
@@ -82,8 +83,8 @@ class DecomposeAndSpawnTool(Tool):
                 },
                 "timeout": {
                     "type": "integer",
-                    "default": 600,
-                    "description": "Timeout in seconds",
+                    "default": 1800,
+                    "description": "Timeout in seconds (default: 1800 = 30 minutes)",
                 },
             },
             "required": ["task", "workers"],
@@ -93,7 +94,7 @@ class DecomposeAndSpawnTool(Tool):
         self,
         task: str,
         workers: list[dict],
-        timeout: int = 600,
+        timeout: int = 1800,
         **kwargs: Any,
     ) -> dict:
         """Dispatch subtasks to worker agents via A2A and collect results."""
@@ -107,19 +108,19 @@ class DecomposeAndSpawnTool(Tool):
             len(workers),
         )
 
-        # Resolve agent_id for each worker
+        # Distribute workers across available agents using round-robin
+        # This ensures parallel execution even if LLM assigns all to the same agent
         available_agents = [
             aid for aid in router._mailboxes.keys()
             if aid != self._agent_id
         ]
 
-        for w in workers:
-            if "agent_id" not in w or not w["agent_id"]:
-                # Default: pick "coding" if available, else first available
-                w["agent_id"] = next(
-                    (a for a in available_agents if a == "coding"),
-                    available_agents[0] if available_agents else self._agent_id,
-                )
+        if available_agents:
+            for i, w in enumerate(workers):
+                w["agent_id"] = available_agents[i % len(available_agents)]
+        else:
+            for w in workers:
+                w["agent_id"] = self._agent_id
 
         # Dispatch all workers in parallel via A2A
         async def dispatch_worker(w: dict) -> dict:

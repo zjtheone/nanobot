@@ -63,7 +63,12 @@ class ToolRegistry:
                     + "; ".join(errors)
                     + f". Expected: {expected}, Received: {received}"
                 )
-            return await tool.execute(**params)
+            result = await tool.execute(**params)
+            # Ensure result is always a string (some tools return dict/list)
+            if not isinstance(result, str):
+                import json
+                result = json.dumps(result, ensure_ascii=False, default=str)
+            return result
         except Exception as e:
             return f"Error executing {name}: {str(e)}"
     
