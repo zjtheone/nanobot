@@ -493,9 +493,26 @@ def gateway(
 # Agent Commands
 # ============================================================================
 
-
 @app.command()
 async def agent(
+    message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
+    session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    markdown: bool = typer.Option(
+        True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
+    ),
+    logs: bool = typer.Option(
+        False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"
+    ),
+    stream: bool = typer.Option(
+        True, "--stream/--no-stream", help="Stream agent output in real-time"
+    ),
+    sandbox: bool = typer.Option(False, "--sandbox", help="Enable Docker sandbox mode"),
+    max_iterations: int = typer.Option(
+        None, "--max-iterations", help="Maximum number of tool iterations"
+    ),
+    image: list[str] = typer.Option(
+        None, "--image", "-i", help="Image file path(s) for multimodal input"
+    ),
 ):
     """Interact with the agent directly."""
     # Check if gateway mode is enabled
