@@ -9,6 +9,17 @@ if TYPE_CHECKING:
     IN_DENYLIST = "in_denylist"
 
 
+class PolicyCheckResult(Enum):
+    """Result of a policy check."""
+
+    ALLOWED = "allowed"
+    DENIED = "denied"
+    DISABLED = "disabled"
+    DEPTH_EXCEEDED = "depth_exceeded"
+    NOT_IN_ALLOWLIST = "not_in_allowlist"
+    IN_DENYLIST = "in_denylist"
+
+
 @dataclass
 class PolicyDecision:
     """Decision from policy check."""

@@ -269,7 +269,9 @@ class GatewayConfig(BaseModel):
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
 
+    provider: str = ""  # "serpapi", "brave", or "" (auto-detect from available keys)
     api_key: str = ""  # Brave Search API key
+    serpapi_key: str = ""  # SerpAPI key
     max_results: int = 5
 
 

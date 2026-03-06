@@ -49,6 +49,24 @@ def make_config():
     return _make_config
 
 
+@pytest.fixture(autouse=True)
+def patch_http_server(monkeypatch):
+    """Disable HTTP server during tests to avoid port conflicts."""
+    from nanobot.gateway import manager as manager_mod
+
+    class FakeHTTPServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(manager_mod, "GatewayHTTPServer", FakeHTTPServer)
+
+
 @pytest.fixture
 def bus():
     """Create a MessageBus for testing."""

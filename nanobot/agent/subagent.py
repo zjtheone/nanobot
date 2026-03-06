@@ -38,6 +38,8 @@ class SubagentManager:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
+        serpapi_key: str | None = None,
+        search_provider: str = "",
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
@@ -50,6 +52,8 @@ class SubagentManager:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
+        self.serpapi_key = serpapi_key
+        self.search_provider = search_provider
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -267,7 +271,11 @@ class SubagentManager:
                     restrict_to_workspace=self.restrict_to_workspace,
                 )
             )
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            tools.register(WebSearchTool(
+                api_key=self.brave_api_key,
+                serpapi_key=self.serpapi_key,
+                provider=self.search_provider,
+            ))
             tools.register(WebFetchTool())
 
             # Allow spawn tool only if not at max depth

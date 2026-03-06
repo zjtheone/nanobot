@@ -2,34 +2,31 @@ import asyncio
 
 import pytest
 
-from nanobot.heartbeat.service import (
-    HEARTBEAT_OK_TOKEN,
-    HeartbeatService,
-)
+from nanobot.heartbeat.service import HeartbeatService
 
 
-def test_heartbeat_ok_detection() -> None:
-    def is_ok(response: str) -> bool:
-        return HEARTBEAT_OK_TOKEN in response.upper()
+class FakeToolCall:
+    def __init__(self, args):
+        self.arguments = args
 
-    assert is_ok("HEARTBEAT_OK")
-    assert is_ok("`HEARTBEAT_OK`")
-    assert is_ok("**HEARTBEAT_OK**")
-    assert is_ok("heartbeat_ok")
-    assert is_ok("HEARTBEAT_OK.")
 
-    assert not is_ok("HEARTBEAT_NOT_OK")
-    assert not is_ok("all good")
+class FakeResponse:
+    def __init__(self, action="skip", tasks=""):
+        self.has_tool_calls = action != "skip"
+        self.tool_calls = [FakeToolCall({"action": action, "tasks": tasks})] if self.has_tool_calls else []
+
+
+class FakeProvider:
+    async def chat(self, **kwargs):
+        return FakeResponse("skip")
 
 
 @pytest.mark.asyncio
 async def test_start_is_idempotent(tmp_path) -> None:
-    async def _on_heartbeat(_: str) -> str:
-        return "HEARTBEAT_OK"
-
     service = HeartbeatService(
         workspace=tmp_path,
-        on_heartbeat=_on_heartbeat,
+        provider=FakeProvider(),
+        model="test-model",
         interval_s=9999,
         enabled=True,
     )
@@ -42,3 +39,17 @@ async def test_start_is_idempotent(tmp_path) -> None:
 
     service.stop()
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_start_disabled(tmp_path) -> None:
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=FakeProvider(),
+        model="test-model",
+        interval_s=9999,
+        enabled=False,
+    )
+
+    await service.start()
+    assert service._task is None

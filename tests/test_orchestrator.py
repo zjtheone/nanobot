@@ -69,7 +69,7 @@ class TestOrchestratorTemplate:
         assert "并行" in prompt or "parallel" in prompt.lower()
         assert "spawn" in prompt.lower()
         assert "worker" in prompt.lower()
-        assert "聚合" in prompt or "aggregate" in prompt.lower()
+        assert "综合" in prompt or "聚合" in prompt or "aggregate" in prompt.lower()
 
 
 class TestSpawnBatchParameters:

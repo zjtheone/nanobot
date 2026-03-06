@@ -345,8 +345,13 @@ def _make_provider(config):
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    multi: bool = typer.Option(False, "--multi", "-m", help="Enable multi-agent routing"),
+    interactive: bool = typer.Option(False, "--interactive", "-i", help="Enable interactive CLI mode"),
 ):
-    """Start the nanobot gateway."""
+    """Start the nanobot gateway.
+
+    Use --multi to enable multi-agent mode with message routing based on bindings.
+    """
     from nanobot.config.loader import load_config, get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
@@ -361,16 +366,86 @@ def gateway(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-
     config = load_config()
     bus = MessageBus()
-    provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
+
+    if multi and config.agents.agent_list:
+        # Multi-agent mode
+        from loguru import logger
+        from nanobot.gateway.manager import MultiAgentGateway
+
+        console.print(
+            f"{__logo__} Starting nanobot gateway in MULTI-AGENT mode on port {port}..."
+        )
+        console.print(f"[cyan]Configured agents:[/cyan] {config.agents.list_agent_ids()}")
+        console.print(f"[cyan]Default agent:[/cyan] {config.agents.default_agent}")
+        console.print(f"[cyan]Routing rules:[/cyan] {len(config.agents.bindings)}")
+
+        gw = MultiAgentGateway(config, bus)
+
+        async def run_multi_agent_gateway():
+            await gw.start()
+
+            # Set cron callback for multi-agent mode
+            async def on_cron_job(job: CronJob) -> str | None:
+                agent = gw.get_agent(config.agents.default_agent)
+                if not agent:
+                    logger.error("Default agent not found for cron job")
+                    return None
+                response = await agent.process_direct(
+                    job.payload.message,
+                    session_key=f"cron:{job.id}",
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to or "direct",
+                )
+                if job.payload.deliver and job.payload.to:
+                    from nanobot.bus.events import OutboundMessage
+
+                    await bus.publish_outbound(
+                        OutboundMessage(
+                            channel=job.payload.channel or "cli",
+                            chat_id=job.payload.to,
+                            content=response or "",
+                        )
+                    )
+                return response
+
+            cron.on_job = on_cron_job
+
+            # Create channels
+            channels = ChannelManager(config, bus)
+
+            if channels.enabled_channels:
+                console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+
+            # Start interactive CLI if enabled
+            if interactive:
+                console.print("\n[cyan]✓[/cyan] Interactive CLI enabled")
+                interactive_task = asyncio.create_task(gw.run_interactive_cli())
+
+            # Run until interrupted
+            try:
+                await cron.start()
+                await channels.start_all()
+                while True:
+                    await asyncio.sleep(1)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                console.print("\nShutting down...")
+                cron.stop()
+                await gw.stop()
+                await channels.stop_all()
+
+        asyncio.run(run_multi_agent_gateway())
+        return
+
+    # Single agent mode (original behavior)
+    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    provider = _make_provider(config)
 
     # Create agent with cron service
     agent = AgentLoop(
@@ -383,6 +458,8 @@ def gateway(
         temperature=config.agents.defaults.temperature,
         frequency_penalty=config.agents.defaults.frequency_penalty,
         brave_api_key=config.tools.web.search.api_key or None,
+        serpapi_key=config.tools.web.search.serpapi_key or None,
+        search_provider=config.tools.web.search.provider,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -527,6 +604,8 @@ def agent(
         temperature=config.agents.defaults.temperature,
         frequency_penalty=config.agents.defaults.frequency_penalty,
         brave_api_key=config.tools.web.search.api_key or None,
+        serpapi_key=config.tools.web.search.serpapi_key or None,
+        search_provider=config.tools.web.search.provider,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         context_window=config.agents.defaults.context_window,
