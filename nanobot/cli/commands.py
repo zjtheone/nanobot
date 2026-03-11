@@ -1312,5 +1312,23 @@ def session_show(
     console.print()
 
 
+# ============================================================================
+# A2A CLI Commands Integration
+# ============================================================================
+
+# Import subagents and sessions CLI apps
+try:
+    from nanobot.cli.subagents import subagents_app
+    app.add_typer(subagents_app, name="subagents", help="Manage subagent runs")
+except ImportError:
+    pass
+
+try:
+    from nanobot.cli.sessions import sessions_app
+    app.add_typer(sessions_app, name="sessions", help="Manage session bindings")
+except ImportError:
+    pass
+
+
 if __name__ == "__main__":
     app()
