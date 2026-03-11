@@ -335,6 +335,10 @@ def gateway(
     bus = MessageBus()
     session_manager = SessionManager(config.workspace_path)
 
+    # Create cron service (needed by both single and multi-agent modes)
+    cron_store_path = get_cron_dir() / "jobs.json"
+    cron = CronService(cron_store_path)
+
     # Multi-agent mode
     if multi:
         from loguru import logger
@@ -399,10 +403,6 @@ def gateway(
 
     # Single agent mode
     provider = _make_provider(config)
-
-    # Create cron service first (callback set after agent creation)
-    cron_store_path = get_cron_dir() / "jobs.json"
-    cron = CronService(cron_store_path)
 
     # Create agent with cron service
     agent = AgentLoop(
