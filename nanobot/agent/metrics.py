@@ -45,6 +45,7 @@ class MetricsTracker:
     Tracks agent performance metrics:
     - Tool usage (success/fail, duration)
     - Token usage
+    - Failure patterns (Self-Improving Agent P0)
     """
 
     def __init__(self, workspace: Path):
@@ -52,6 +53,7 @@ class MetricsTracker:
         # Store metrics in workspace/.nanobot/metrics.json for now to keep it project-specific
         self.metrics_dir = workspace / ".nanobot"
         self.metrics_file = self.metrics_dir / "metrics.json"
+        self.failure_patterns_file = self.metrics_dir / "failure_patterns.json"
         self._ensure_storage()
         self._load()
 
@@ -62,6 +64,7 @@ class MetricsTracker:
     def _load(self):
         self.tool_calls: List[ToolCallRecord] = []
         self.token_usage: List[TokenUsageRecord] = []
+        self.failure_patterns: Dict[str, int] = {}  # pattern -> count
         
         if self.metrics_file.exists():
             try:
@@ -72,6 +75,13 @@ class MetricsTracker:
                     self.token_usage.append(TokenUsageRecord(**tu))
             except Exception as e:
                 logger.error(f"Failed to load metrics: {e}")
+        
+        # Load failure patterns (Self-Improving Agent P0)
+        if self.failure_patterns_file.exists():
+            try:
+                self.failure_patterns = json.loads(self.failure_patterns_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.error(f"Failed to load failure patterns: {e}")
 
     def _save(self):
         try:
@@ -81,6 +91,11 @@ class MetricsTracker:
                 "last_updated": datetime.now().isoformat()
             }
             self.metrics_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            
+            # Save failure patterns separately (Self-Improving Agent P0)
+            self.failure_patterns_file.write_text(
+                json.dumps(self.failure_patterns, indent=2), encoding="utf-8"
+            )
         except Exception as e:
             logger.error(f"Failed to save metrics: {e}")
 
@@ -93,7 +108,48 @@ class MetricsTracker:
             error_message=str(error) if error else None
         )
         self.tool_calls.append(record)
+        
+        # Self-Improving: Track failure patterns (P0)
+        if not success and error:
+            self._track_failure_pattern(tool_name, error)
+        
         # Auto-save every record for now (low volume)
+        self._save()
+    
+    def _track_failure_pattern(self, tool_name: str, error: str) -> None:
+        """
+        Track failure patterns for self-improvement (P0).
+        
+        Extracts key error patterns and tracks their frequency.
+        """
+        # Normalize error message (first 100 chars, lowercase)
+        error_key = error[:100].lower().strip()
+        
+        # Create pattern key with tool name
+        pattern_key = f"{tool_name}: {error_key}"
+        
+        # Increment count
+        self.failure_patterns[pattern_key] = self.failure_patterns.get(pattern_key, 0) + 1
+        
+        logger.debug(f"Tracked failure pattern: {pattern_key} (count: {self.failure_patterns[pattern_key]})")
+    
+    def get_failure_patterns(self, limit: int = 10) -> list[tuple[str, int]]:
+        """
+        Get top failure patterns sorted by frequency.
+        
+        Returns:
+            List of (pattern, count) tuples.
+        """
+        sorted_patterns = sorted(
+            self.failure_patterns.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        return sorted_patterns[:limit]
+    
+    def clear_failure_patterns(self) -> None:
+        """Clear all tracked failure patterns."""
+        self.failure_patterns = {}
         self._save()
 
     def record_tokens(self, prompt: int, completion: int):
@@ -142,26 +198,171 @@ class MetricsTracker:
         tool_stats: Dict[str, Dict] = {}
         for tc in self.tool_calls:
             if tc.tool_name not in tool_stats:
-                tool_stats[tc.tool_name] = {"count": 0, "failures": 0, "total_time": 0.0}
+                tool_stats[tc.tool_name] = {
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "total_duration": 0.0,
+                }
             
-            stats = tool_stats[tc.tool_name]
-            stats["count"] += 1
-            stats["total_time"] += tc.duration_seconds
-            if not tc.success:
-                stats["failures"] += 1
+            tool_stats[tc.tool_name]["total"] += 1
+            if tc.success:
+                tool_stats[tc.tool_name]["success"] += 1
+            else:
+                tool_stats[tc.tool_name]["failed"] += 1
+            tool_stats[tc.tool_name]["total_duration"] += tc.duration_seconds
         
-        lines = ["## Agent Metrics Report", f"Total Tool Calls: {total_calls}", ""]
-        lines.append("| Tool | Count | Failure Rate | Avg Time |")
-        lines.append("|---|---|---|---|")
+        lines = [
+            "## Session Metrics",
+            "",
+            f"**Total Tool Calls**: {total_calls}",
+            "",
+            "### Tool Usage",
+        ]
         
-        for name, stats in sorted(tool_stats.items(), key=lambda x: x[1]["count"], reverse=True):
-            fail_rate = (stats["failures"] / stats["count"]) * 100
-            avg_time = stats["total_time"] / stats["count"]
-            lines.append(f"| {name} | {stats['count']} | {fail_rate:.1f}% | {avg_time:.2f}s |")
-
-        # Token Stats
-        total_tokens = sum(t.total_tokens for t in self.token_usage)
-        lines.append("")
-        lines.append(f"**Total Tokens Consumed**: {total_tokens:,}")
+        for name, stats in sorted(tool_stats.items(), key=lambda x: x[1]["total"], reverse=True):
+            success_rate = stats["success"] / stats["total"] * 100 if stats["total"] > 0 else 0
+            avg_duration = stats["total_duration"] / stats["total"] if stats["total"] > 0 else 0
+            lines.append(f"- **{name}**: {stats['total']} calls, {success_rate:.0f}% success, {avg_duration:.2f}s avg")
+        
+        # Token usage
+        token_summary = self.get_session_usage()
+        if token_summary["total_tokens"] > 0:
+            lines.extend([
+                "",
+                "### Token Usage",
+                f"- **Prompt**: {token_summary['prompt_tokens']:,}",
+                f"- **Completion**: {token_summary['completion_tokens']:,}",
+                f"- **Total**: {token_summary['total_tokens']:,}",
+            ])
+            estimated_cost = self.estimate_cost()
+            if estimated_cost > 0:
+                lines.append(f"- **Estimated Cost**: ${estimated_cost:.4f}")
+        
+        # Failure patterns
+        failure_patterns = self.get_failure_patterns(5)
+        if failure_patterns:
+            lines.extend([
+                "",
+                "### Top Failure Patterns",
+            ])
+            for pattern, count in failure_patterns:
+                lines.append(f"- ({count}x) {pattern[:80]}")
         
         return "\n".join(lines)
+    
+    def get_tool_statistics(self, tool_name: str) -> dict[str, Any]:
+        """
+        Get detailed statistics for a specific tool (P1 - Tool Optimization).
+        
+        Args:
+            tool_name: Name of the tool.
+        
+        Returns:
+            Dictionary with tool statistics.
+        """
+        tool_calls = [tc for tc in self.tool_calls if tc.tool_name == tool_name]
+        
+        if not tool_calls:
+            return {}
+        
+        total = len(tool_calls)
+        successful = sum(1 for tc in tool_calls if tc.success)
+        failed = total - successful
+        total_duration = sum(tc.duration_seconds for tc in tool_calls)
+        
+        # Calculate duration percentiles
+        durations = sorted(tc.duration_seconds for tc in tool_calls)
+        p50 = durations[len(durations) // 2] if durations else 0
+        p95 = durations[int(len(durations) * 0.95)] if durations else 0
+        
+        # Failure reasons
+        failure_reasons: dict[str, int] = {}
+        for tc in tool_calls:
+            if not tc.success and tc.error_message:
+                key = tc.error_message[:50].lower().strip()
+                failure_reasons[key] = failure_reasons.get(key, 0) + 1
+        
+        return {
+            "tool_name": tool_name,
+            "total_calls": total,
+            "successful_calls": successful,
+            "failed_calls": failed,
+            "success_rate": successful / total if total > 0 else 0,
+            "total_duration": total_duration,
+            "avg_duration": total_duration / total if total > 0 else 0,
+            "p50_duration": p50,
+            "p95_duration": p95,
+            "max_duration": max(durations) if durations else 0,
+            "failure_reasons": failure_reasons,
+        }
+    
+    def get_tool_success_rates(self) -> dict[str, float]:
+        """
+        Get success rates for all tools (P1 - Tool Optimization).
+        
+        Returns:
+            Dictionary mapping tool names to success rates.
+        """
+        tool_stats: dict[str, dict] = {}
+        
+        for tc in self.tool_calls:
+            if tc.tool_name not in tool_stats:
+                tool_stats[tc.tool_name] = {"total": 0, "success": 0}
+            tool_stats[tc.tool_name]["total"] += 1
+            if tc.success:
+                tool_stats[tc.tool_name]["success"] += 1
+        
+        return {
+            name: stats["success"] / stats["total"] if stats["total"] > 0 else 0
+            for name, stats in tool_stats.items()
+        }
+    
+    def get_tool_performance_ranking(
+        self,
+        min_calls: int = 1,
+        metric: str = "success_rate",
+    ) -> list[tuple[str, float]]:
+        """
+        Get tool performance ranking (P1 - Tool Optimization).
+        
+        Args:
+            min_calls: Minimum number of calls to include.
+            metric: Metric to rank by (success_rate, avg_duration, total_calls).
+        
+        Returns:
+            List of (tool_name, score) tuples sorted by score.
+        """
+        tool_stats: dict[str, dict] = {}
+        
+        for tc in self.tool_calls:
+            if tc.tool_name not in tool_stats:
+                tool_stats[tc.tool_name] = {
+                    "total": 0,
+                    "success": 0,
+                    "total_duration": 0.0,
+                }
+            tool_stats[tc.tool_name]["total"] += 1
+            if tc.success:
+                tool_stats[tc.tool_name]["success"] += 1
+            tool_stats[tc.tool_name]["total_duration"] += tc.duration_seconds
+        
+        rankings = []
+        for name, stats in tool_stats.items():
+            if stats["total"] < min_calls:
+                continue
+            
+            if metric == "success_rate":
+                score = stats["success"] / stats["total"] if stats["total"] > 0 else 0
+            elif metric == "avg_duration":
+                score = stats["total_duration"] / stats["total"] if stats["total"] > 0 else 0
+            else:  # total_calls
+                score = float(stats["total"])
+            
+            rankings.append((name, score))
+        
+        # Sort: higher is better for success_rate/total_calls, lower for duration
+        reverse = metric != "avg_duration"
+        rankings.sort(key=lambda x: x[1], reverse=reverse)
+        
+        return rankings

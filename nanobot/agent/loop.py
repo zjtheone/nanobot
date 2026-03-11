@@ -200,6 +200,57 @@ class AgentLoop:
         # Announce chain for hierarchical result aggregation
         self.announce_chain = AnnounceChainManager()
 
+        # Self-Improving Agent Components (P0/P1/P2)
+        from nanobot.agent.reflection import ReflectionEngine
+        from nanobot.agent.experience import ExperienceRepository
+        from nanobot.agent.confidence import ConfidenceEvaluator
+        from nanobot.agent.tool_optimizer import ToolOptimizer
+        from nanobot.agent.skill_evolution import SkillEvolutionAnalyzer
+        from nanobot.agent.skills import SkillsLoader
+
+        self.reflection_engine = ReflectionEngine(workspace, provider, self.model)
+        self.experience_repo = ExperienceRepository(workspace)
+
+        # Confidence Evaluator (P1)
+        self.confidence_evaluator = ConfidenceEvaluator(
+            workspace,
+            provider=provider,
+            model=self.model,
+            threshold=0.7,
+            auto_verify=self.auto_verify,
+        )
+
+        # Tool Optimizer (P1)
+        self.tool_optimizer = ToolOptimizer(
+            workspace,
+            metrics_tracker=self.metrics,
+            min_samples=3,
+            prefer_fast_tools=True,
+        )
+
+        # 动态技能发现 (P2)
+        self.skills_loader = SkillsLoader(workspace)
+        self._known_skills: dict[str, str] = {
+            s["name"]: s["source"]
+            for s in self.skills_loader.list_skills(filter_unavailable=False)
+        }
+
+        # Skill Evolution Analyzer (P2) - integrated with reflection and experience
+        self.skill_analyzer = SkillEvolutionAnalyzer(
+            workspace=workspace,
+            experience_repo=self.experience_repo,
+            metrics_tracker=self.metrics,
+            tool_optimizer=self.tool_optimizer,
+            skills_dir=workspace / "skills",
+            skills_loader=self.skills_loader,
+        )
+        
+        # Track tool execution for reflection
+        self._current_task_tool_calls: list[dict[str, Any]] = []
+        self._current_task_start_time: float = 0.0
+        self._current_task_description: str = ""
+        self._pending_reflection_tasks: set[asyncio.Task] = set()
+
         self._running = False
         self._processing = False  # True while actively processing a message
         self._register_default_tools()
@@ -387,6 +438,46 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        
+        # Self-Improving Agent Tools (P0/P1/P2)
+        from nanobot.agent.tools.self_improvement import (
+            GetReflectionsTool,
+            GetExperienceTool,
+            GetSelfImprovementMetricsTool,
+            GetConfidenceTool,
+            GetToolRecommendationsTool,
+            GetSkillEvolutionTool,
+        )
+        
+        # P0 Tools
+        self.tools.register(GetReflectionsTool(self.reflection_engine, self.experience_repo))
+        self.tools.register(GetExperienceTool(self.experience_repo))
+        
+        # P1 Tools
+        self.tools.register(GetConfidenceTool(self.confidence_evaluator))
+        self.tools.register(GetToolRecommendationsTool(self.tool_optimizer))
+        
+        # P2 Tools - Re-initialize skill analyzer after tools are registered
+        from nanobot.agent.skill_evolution import SkillEvolutionAnalyzer
+        self.skill_analyzer = SkillEvolutionAnalyzer(
+            self.workspace,
+            experience_repo=self.experience_repo,
+            metrics_tracker=self.metrics,
+            tool_optimizer=self.tool_optimizer,
+            skills_dir=self.workspace / "skills",
+            skills_loader=self.skills_loader,
+        )
+        self.tools.register(GetSkillEvolutionTool(self.skill_analyzer))
+        
+        # Combined metrics tool
+        self.tools.register(GetSelfImprovementMetricsTool(
+            self.reflection_engine,
+            self.experience_repo,
+            self.metrics,
+            tool_optimizer=self.tool_optimizer,
+            skill_analyzer=self.skill_analyzer,
+        ))
+        logger.info("Registered self-improvement tools (P0/P1/P2)")
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -422,6 +513,15 @@ class AgentLoop:
                     await self._poll_a2a_mailbox()
                     continue
         finally:
+            # 等待未完成的反思任务，确保数据不丢失
+            if self._pending_reflection_tasks:
+                logger.info(f"Waiting for {len(self._pending_reflection_tasks)} pending reflection tasks...")
+                done, pending = await asyncio.wait(self._pending_reflection_tasks, timeout=10.0)
+                if pending:
+                    logger.warning(f"{len(pending)} reflection tasks did not complete in time, cancelling")
+                    for t in pending:
+                        t.cancel()
+
             if hasattr(self, "lsp_manager"):
                 logger.info("Shutting down LSP manager...")
                 await self.lsp_manager.shutdown()
@@ -559,6 +659,9 @@ class AgentLoop:
             return await self._process_system_message(msg)
 
         self._processing = True
+        self._current_task_start_time = time.time()
+        self._current_task_description = msg.content[:500]
+        self._current_task_tool_calls = []
         try:
             return await self._process_message_inner(msg, session_key, on_progress)
         finally:
@@ -634,10 +737,19 @@ class AgentLoop:
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
 
+        # 高频技能自动加载：将使用频率高且成功率达标的技能注入系统提示词
+        frequent_skills = None
+        if self.skill_analyzer:
+            frequent = self.skill_analyzer.get_frequently_used_skills(min_uses=3, min_success_rate=0.5)
+            if frequent:
+                frequent_skills = frequent
+                logger.debug(f"Auto-loading frequent skills: {frequent}")
+
         # Build initial messages (use get_history for LLM-formatted messages)
         messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
+            skill_names=frequent_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -800,6 +912,29 @@ class AgentLoop:
             session.add_message("assistant", final_content)
         self.sessions.save(session)
 
+        # Self-Improving: Generate reflection after task completion (P0)
+        # Run asynchronously in background to avoid blocking user response
+        task_status = "failure" if is_error else ("success" if iteration < self.max_iterations else "partial_success")
+
+        # Create background task for reflection (non-blocking, but tracked for shutdown)
+        reflection_task = asyncio.create_task(
+            self._generate_task_reflection(
+                task_description=self._current_task_description or msg.content[:200],
+                status=task_status,
+                duration=time.time() - self._current_task_start_time,
+                tokens_used=total_usage.get("total_tokens", 0),
+            )
+        )
+        self._pending_reflection_tasks.add(reflection_task)
+
+        def _reflection_done(t: asyncio.Task) -> None:
+            self._pending_reflection_tasks.discard(t)
+            if not t.cancelled() and t.exception():
+                logger.error(f"Reflection task failed: {t.exception()}")
+
+        reflection_task.add_done_callback(_reflection_done)
+        logger.debug(f"Reflection task created: {reflection_task.get_name()}")
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -844,9 +979,11 @@ class AgentLoop:
             cron_tool.set_context(origin_channel, origin_chat_id)
 
         # Build messages with the announce content
+        _frequent = self.skill_analyzer.get_frequently_used_skills() if self.skill_analyzer else None
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
+            skill_names=_frequent or None,
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
@@ -1002,6 +1139,40 @@ class AgentLoop:
 
         duration = time.time() - start_time
         self.metrics.record_tool_call(name, success, duration, error_msg)
+        
+        # Self-Improving: Track tool call for reflection (P0)
+        self._current_task_tool_calls.append({
+            "tool_name": name,
+            "arguments": arguments,
+            "success": success,
+            "duration": duration,
+            "error": error_msg,
+        })
+        
+        # Self-Improving: Track for tool optimization (P1)
+        if self.tool_optimizer:
+            self.tool_optimizer.record_tool_execution(
+                tool_name=name,
+                success=success,
+                duration=duration,
+                error=error_msg,
+                task_description=self._current_task_description[:100] if self._current_task_description else None,
+                category=self._infer_tool_category(name),
+            )
+        
+        # Self-Improving: Track skill usage (P2) - 动态技能检测
+        if self.skill_analyzer:
+            is_skill = name in self._known_skills or name.startswith("skill_")
+
+            if is_skill:
+                self.skill_analyzer.track_skill_usage(
+                    skill_name=name,
+                    success=success,
+                    duration=duration,
+                    task_description=self._current_task_description[:200] if self._current_task_description else "",
+                    error_message=error_msg or "",
+                    skill_source=self._known_skills.get(name, "unknown"),
+                )
 
         # Post-hooks
         ctx.result = result
@@ -1010,6 +1181,50 @@ class AgentLoop:
             result = ctx.modified_result
 
         return result
+    
+    def _infer_tool_category(self, tool_name: str) -> str:
+        """Infer tool category for optimization tracking (P1)."""
+        name_lower = tool_name.lower()
+        
+        if any(x in name_lower for x in ["read_file", "write_file", "edit_file", "list_dir"]):
+            return "file_operation"
+        elif any(x in name_lower for x in ["web_search", "web_fetch", "grep", "find_files", "find_definitions"]):
+            return "search"
+        elif any(x in name_lower for x in ["exec", "shell"]):
+            return "shell"
+        elif any(x in name_lower for x in ["git_"]):
+            return "git"
+        elif any(x in name_lower for x in ["memory_search"]):
+            return "memory"
+        elif any(x in name_lower for x in ["diagnostic", "test", "run_diagnostics"]):
+            return "test"
+        elif any(x in name_lower for x in ["message", "send"]):
+            return "communication"
+        elif any(x in name_lower for x in ["spawn", "subagent"]):
+            return "orchestration"
+        elif any(x in name_lower for x in ["plan", "update_plan"]):
+            return "planning"
+        else:
+            return "general"
+    
+    def _infer_task_domain(self, task_description: str) -> str:
+        """Infer task domain from description for confidence evaluation (P1)."""
+        desc_lower = task_description.lower()
+        
+        if any(x in desc_lower for x in ["code", "function", "class", "import", "def ", "package"]):
+            return "code"
+        elif any(x in desc_lower for x in ["file", "read", "write", "create", "delete", "directory"]):
+            return "file_operation"
+        elif any(x in desc_lower for x in ["calculate", "math", "compute", "formula", "equation"]):
+            return "math"
+        elif any(x in desc_lower for x in ["search", "find", "lookup", "query"]):
+            return "web_search"
+        elif any(x in desc_lower for x in ["debug", "error", "fix", "issue", "bug"]):
+            return "debugging"
+        elif any(x in desc_lower for x in ["test", "verify", "check", "validate"]):
+            return "test"
+        else:
+            return "general"
 
     def _trim_context(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
@@ -1154,6 +1369,149 @@ class AgentLoop:
 
         return messages, has_errors
 
+    async def _generate_task_reflection(
+        self,
+        task_description: str,
+        status: str,
+        duration: float,
+        tokens_used: int,
+    ) -> None:
+        """
+        Generate reflection report after task completion (P0 - Self-Improving Agent).
+        
+        Args:
+            task_description: What the task was trying to accomplish
+            status: Task outcome (success/partial_success/failure)
+            duration: Task duration in seconds
+            tokens_used: Total tokens consumed
+        """
+        task_id = f"task_{int(time.time())}"
+        logger.info(f"📝 Starting reflection for task {task_id} (status={status}, duration={duration:.2f}s)")
+        
+        try:
+            # Generate reflection report
+            report = await self.reflection_engine.generate_reflection(
+                task_id=task_id,
+                task_description=task_description,
+                status=status,
+                duration=duration,
+                tool_calls=self._current_task_tool_calls,
+                tokens_used=tokens_used,
+                errors=[tc.get("error", "") for tc in self._current_task_tool_calls if tc.get("error")],
+            )
+            
+            # Store experience in repository
+            if report.what_went_well or report.suggested_improvements or report.lessons_learned:
+                # Determine task category (simple heuristic)
+                category = self._categorize_task(task_description, self._current_task_tool_calls)
+                
+                logger.debug(f"Adding experience to repository: category={category}")
+                self.experience_repo.add_experience(
+                    task_description=task_description[:200],
+                    task_category=category,
+                    success=(status == "success"),
+                    input_context=task_description[:500],
+                    solution_approach=", ".join(set(tc.get("tool_name", "") for tc in self._current_task_tool_calls)),
+                    tools_used=list(set(tc.get("tool_name", "") for tc in self._current_task_tool_calls)),
+                    outcome_description=report.lessons_learned[0] if report.lessons_learned else status,
+                    key_insights=report.lessons_learned[:3],
+                    warnings=report.what_went_poorly[:2],
+                    is_generalizable=True,
+                    applicability_conditions=[],
+                    confidence_score=report.confidence_score,
+                    tags=[status, category],
+                )
+                logger.info(f"✅ Experience stored in repository")
+
+                # 反馈置信度预测结果（闭环学习）
+                if self.confidence_evaluator and hasattr(report, 'confidence_score'):
+                    self.confidence_evaluator.record_outcome(
+                        question=task_description[:200],
+                        predicted_score=report.confidence_score,
+                        actual_success=(status == "success"),
+                        domain=category,
+                    )
+
+            logger.info(f"✅ Reflection completed: status={status}, confidence={report.confidence_score:.2f}, insights={len(report.lessons_learned)}")
+            
+            # Trigger skill evolution analysis (P2 - Self-Improving Agent)
+            if self.skill_analyzer:
+                logger.debug("🧬 Triggering skill evolution analysis...")
+                try:
+                    # Analyze skill usage from recent experiences
+                    skill_stats = self.skill_analyzer.analyze_skill_usage(period_days=30)
+                    
+                    # Detect usage patterns
+                    patterns = self.skill_analyzer.detect_usage_patterns()
+                    
+                    # Identify skill gaps
+                    gaps = self.skill_analyzer.identify_gaps()
+                    
+                    # Generate evolution report
+                    evolution_report = self.skill_analyzer.generate_report(period_days=30)
+                    
+                    # Save report
+                    self.skill_analyzer._save_report(evolution_report)
+                    
+                    logger.info(f"🧬 Skill evolution analysis completed: {len(skill_stats)} skills analyzed, {len(gaps)} gaps identified")
+                    
+                    # Log critical skill gaps
+                    if gaps:
+                        critical_gaps = [g for g in gaps if g.impact == "high"]
+                        if critical_gaps:
+                            logger.warning(f"⚠️ Found {len(critical_gaps)} critical skill gaps:")
+                            for gap in critical_gaps[:3]:  # Show top 3
+                                logger.warning(f"  - {gap.description}: {gap.recommendation}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Skill evolution analysis failed: {type(e).__name__}: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ Reflection timed out for task {task_id}")
+        except Exception as e:
+            logger.error(f"❌ Task reflection failed: {type(e).__name__}: {e}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+        finally:
+            # Reset task tracking
+            self._current_task_tool_calls = []
+            self._current_task_description = ""
+    
+    def _categorize_task(self, description: str, tool_calls: list[dict]) -> str:
+        """
+        Categorize task based on description and tools used.
+        
+        Returns a category string for experience organization.
+        """
+        # Check tool usage patterns
+        tool_names = set(tc.get("tool_name", "") for tc in tool_calls)
+        
+        if any("file" in t for t in tool_names):
+            return "file_operation"
+        if any("exec" in t or "shell" in t for t in tool_names):
+            return "shell_command"
+        if any("search" in t or "grep" in t for t in tool_names):
+            return "code_search"
+        if any("web" in t for t in tool_names):
+            return "web_research"
+        if any("git" in t for t in tool_names):
+            return "version_control"
+        if any("test" in t or "diagnostic" in t for t in tool_names):
+            return "testing"
+        
+        # Fallback: keyword matching
+        desc_lower = description.lower()
+        if "create" in desc_lower or "write" in desc_lower:
+            return "creation"
+        if "fix" in desc_lower or "bug" in desc_lower or "error" in desc_lower:
+            return "debugging"
+        if "analyze" in desc_lower or "review" in desc_lower:
+            return "analysis"
+        
+        return "general"
+
     async def process_direct(
         self,
         content: str,
@@ -1217,10 +1575,12 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(session_key)
 
-        # Build initial messages
+        # Build initial messages (with high-frequency skills auto-loaded)
+        _frequent = self.skill_analyzer.get_frequently_used_skills() if self.skill_analyzer else None
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=content,
+            skill_names=_frequent or None,
             media=media,
             channel=channel,
             chat_id=chat_id,
@@ -1431,13 +1791,44 @@ class AgentLoop:
         # Save to session (skip error/empty responses to avoid polluting history)
         final_text = "".join(final_content_parts) if final_content_parts else ""
         session.add_message("user", content)
+        
+        # Self-Improving: Confidence Injection (P1)
+        confidence_suffix = ""
+        if final_text and self.confidence_evaluator and not is_error_response:
+            # Evaluate confidence in the answer
+            confidence_result = self.confidence_evaluator.evaluate(
+                question=content[:500],
+                answer=final_text,
+                context={
+                    "domain": self._infer_task_domain(content),
+                    "tool_calls": len(self._current_task_tool_calls),
+                },
+                tool_results=self._current_task_tool_calls,
+            )
+            
+            # Add confidence suffix for low/medium confidence answers
+            if confidence_result.level in ("low", "medium"):
+                confidence_suffix = "\n\n" + self.confidence_evaluator.generate_verification_prompt(confidence_result)
+            
+            # Record confidence to metrics
+            self.metrics.record_tool_call(
+                tool_name="confidence_evaluation",
+                success=True,
+                duration=0.0,
+                error=None,
+            )
+        
         if final_text and not is_error_response:
-            session.add_message("assistant", final_text)
+            session.add_message("assistant", final_text + confidence_suffix)
         self.sessions.save(session)
 
         # Yield usage summary as a special final chunk
         if total_usage.get("total_tokens", 0) > 0:
             yield f"\n\n[tokens: {total_usage['prompt_tokens']:,} in + {total_usage['completion_tokens']:,} out = {total_usage['total_tokens']:,} total]"
+        
+        # Yield confidence suffix if present
+        if confidence_suffix:
+            yield confidence_suffix
 
         # Warn if max iterations reached
         if iteration >= self.max_iterations and not final_content_parts:
