@@ -6,7 +6,7 @@ runner = CliRunner()
 
 
 def test_cron_add_rejects_invalid_timezone(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("nanobot.config.loader.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: tmp_path / "cron")
 
     result = runner.invoke(
         app,

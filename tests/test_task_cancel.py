@@ -81,7 +81,10 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"},
+            session_key="test:c1", parent_session_key=None, depth=0, max_depth=1,
+        )
 
         assistant_messages = [
             msg for msg in captured_second_call

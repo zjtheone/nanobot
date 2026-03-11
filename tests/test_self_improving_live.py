@@ -11,6 +11,14 @@ This script runs actual nanobot tasks and verifies that:
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
+
+
+def _make_mock_provider():
+    """Create a mock LLM provider for testing."""
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    return provider
 
 
 async def test_confidence_tracking():
@@ -18,19 +26,18 @@ async def test_confidence_tracking():
     print("\n" + "=" * 60)
     print("Test 1: Confidence Tracking")
     print("=" * 60)
-    
+
     from nanobot.agent.loop import AgentLoop
-    from nanobot.providers.openai import OpenAIProvider
     from nanobot.bus.queue import MessageBus
     from nanobot.session.manager import SessionManager
     from nanobot.config.schema import ExecToolConfig
-    
+
     workspace = Path.home() / "workspace" / "AI" / "github" / "nanobot"
-    
+
     # Create minimal agent loop
     bus = MessageBus()
-    provider = OpenAIProvider(api_key="test")  # Won't actually call API
-    
+    provider = _make_mock_provider()
+
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -40,19 +47,19 @@ async def test_confidence_tracking():
         session_manager=SessionManager(workspace),
         exec_config=ExecToolConfig(),
     )
-    
+
     # Check confidence evaluator exists
-    assert hasattr(agent, 'confidence_evaluator'), "❌ Confidence evaluator not initialized"
-    print("✅ Confidence evaluator initialized")
-    
+    assert hasattr(agent, 'confidence_evaluator'), "Confidence evaluator not initialized"
+    print("OK Confidence evaluator initialized")
+
     # Check reflection engine exists
-    assert hasattr(agent, 'reflection_engine'), "❌ Reflection engine not initialized"
-    print("✅ Reflection engine initialized")
-    
+    assert hasattr(agent, 'reflection_engine'), "Reflection engine not initialized"
+    print("OK Reflection engine initialized")
+
     # Check experience repo exists
-    assert hasattr(agent, 'experience_repo'), "❌ Experience repository not initialized"
-    print("✅ Experience repository initialized")
-    
+    assert hasattr(agent, 'experience_repo'), "Experience repository not initialized"
+    print("OK Experience repository initialized")
+
     # Test confidence evaluation directly
     result = agent.confidence_evaluator.evaluate(
         question="What is 2+2?",
@@ -60,18 +67,18 @@ async def test_confidence_tracking():
         context={"domain": "math"},
         tool_results=[],
     )
-    
-    print(f"✅ Confidence evaluation works: score={result.score:.3f}, level={result.level}")
-    
+
+    print(f"OK Confidence evaluation works: score={result.score:.3f}, level={result.level}")
+
     # Check if history file was created
     history_file = workspace / ".nanobot" / "confidence_history.jsonl"
     if history_file.exists():
         with open(history_file) as f:
             lines = f.readlines()
-        print(f"✅ Confidence history file created with {len(lines)} records")
+        print(f"OK Confidence history file created with {len(lines)} records")
     else:
-        print("⚠️  Confidence history file not created (expected for test)")
-    
+        print("NOTE: Confidence history file not created (expected for test)")
+
     return True
 
 
@@ -80,15 +87,14 @@ async def test_reflection_generation():
     print("\n" + "=" * 60)
     print("Test 2: Reflection Generation")
     print("=" * 60)
-    
+
     workspace = Path.home() / "workspace" / "AI" / "github" / "nanobot"
-    
+
     from nanobot.agent.reflection import ReflectionEngine
-    from nanobot.providers.openai import OpenAIProvider
-    
-    provider = OpenAIProvider(api_key="test")
+
+    provider = _make_mock_provider()
     reflection_engine = ReflectionEngine(workspace, provider, "gpt-4o-mini")
-    
+
     # Generate a test reflection
     report = await reflection_engine.generate_reflection(
         task_id="test_live_001",
@@ -102,20 +108,20 @@ async def test_reflection_generation():
         tokens_used=500,
         errors=[],
     )
-    
-    print(f"✅ Reflection generated: confidence={report.confidence_score:.3f}")
+
+    print(f"OK Reflection generated: confidence={report.confidence_score:.3f}")
     print(f"   - What went well: {len(report.what_went_well)} items")
     print(f"   - Lessons learned: {len(report.lessons_learned)} items")
-    
+
     # Check reflection file
     reflection_file = workspace / ".nanobot" / "reflections" / "reflection_reports.jsonl"
     if reflection_file.exists():
         with open(reflection_file) as f:
             lines = f.readlines()
-        print(f"✅ Reflection file has {len(lines)} records")
+        print(f"OK Reflection file has {len(lines)} records")
     else:
-        print("⚠️  Reflection file not found")
-    
+        print("NOTE: Reflection file not found")
+
     return True
 
 
@@ -124,13 +130,13 @@ async def test_experience_storage():
     print("\n" + "=" * 60)
     print("Test 3: Experience Storage")
     print("=" * 60)
-    
+
     workspace = Path.home() / "workspace" / "AI" / "github" / "nanobot"
-    
+
     from nanobot.agent.experience import ExperienceRepository
-    
+
     experience_repo = ExperienceRepository(workspace)
-    
+
     # Add a test experience
     experience_repo.add_experience(
         task_description="Live test experience",
@@ -146,22 +152,22 @@ async def test_experience_storage():
         confidence_score=0.95,
         tags=["live_test", "verification"],
     )
-    
-    print("✅ Experience added")
-    
+
+    print("OK Experience added")
+
     # Check experience file
     experience_file = workspace / ".nanobot" / "experience" / "experiences.jsonl"
     if experience_file.exists():
         with open(experience_file) as f:
             lines = f.readlines()
-        print(f"✅ Experience file has {len(lines)} records")
-        
+        print(f"OK Experience file has {len(lines)} records")
+
         # Show latest
         latest = json.loads(lines[-1])
         print(f"   - Latest: {latest['task_description']} ({latest['type']})")
     else:
-        print("⚠️  Experience file not found")
-    
+        print("NOTE: Experience file not found")
+
     return True
 
 
@@ -170,26 +176,28 @@ async def test_tool_optimizer():
     print("\n" + "=" * 60)
     print("Test 4: Tool Optimizer")
     print("=" * 60)
-    
+
     workspace = Path.home() / "workspace" / "AI" / "github" / "nanobot"
-    
+
     from nanobot.agent.tool_optimizer import ToolOptimizer
-    
-    optimizer = ToolOptimizer(workspace)
-    
+    from nanobot.agent.metrics import MetricsTracker
+
+    metrics = MetricsTracker(workspace)
+    optimizer = ToolOptimizer(workspace, metrics)
+
     # Record some test tool calls
-    optimizer.record_tool_call("read_file", True, 0.05, None)
-    optimizer.record_tool_call("read_file", True, 0.03, None)
-    optimizer.record_tool_call("grep", True, 0.15, None)
-    optimizer.record_tool_call("exec", False, 30.0, "timeout")
-    
+    optimizer.record_tool_execution("read_file", True, 0.05, None)
+    optimizer.record_tool_execution("read_file", True, 0.03, None)
+    optimizer.record_tool_execution("grep", True, 0.15, None)
+    optimizer.record_tool_execution("exec", False, 30.0, "timeout")
+
     # Get recommendations
-    recs = optimizer.get_recommendations("read file content")
-    
-    print(f"✅ Tool optimizer works")
+    recs = optimizer.recommend_tool("read file content")
+
+    print("OK Tool optimizer works")
     print(f"   - Top recommendation: {recs[0].tool_name if recs else 'N/A'}")
-    print(f"   - Total tools tracked: {len(optimizer.get_stats().get('tools', {}))}")
-    
+    print(f"   - Total tools tracked: {len(optimizer.get_all_statistics())}")
+
     return True
 
 
@@ -198,34 +206,33 @@ async def test_skill_evolution():
     print("\n" + "=" * 60)
     print("Test 5: Skill Evolution")
     print("=" * 60)
-    
+
     workspace = Path.home() / "workspace" / "AI" / "github" / "nanobot"
-    
+
     from nanobot.agent.skill_evolution import SkillEvolutionAnalyzer
-    
-    analyzer = SkillEvolutionAnalyzer(workspace)
-    
-    # Record some skill usage
-    analyzer.record_skill_usage("weather", True, 1.5, "get_current_weather")
-    analyzer.record_skill_usage("weather", True, 1.3, "get_forecast")
-    analyzer.record_skill_usage("jdcloud-mongodb", True, 2.0, "list_instances")
-    
+    from nanobot.agent.experience import ExperienceRepository
+    from nanobot.agent.metrics import MetricsTracker
+    from nanobot.agent.tool_optimizer import ToolOptimizer
+
+    experience_repo = ExperienceRepository(workspace)
+    metrics = MetricsTracker(workspace)
+    optimizer = ToolOptimizer(workspace, metrics)
+    analyzer = SkillEvolutionAnalyzer(workspace, experience_repo, metrics, optimizer)
+
     # Get report
     report = analyzer.generate_report()
-    
-    print(f"✅ Skill evolution analyzer works")
-    print(f"   - Skills tracked: {len(report.get('skills', []))}")
-    print(f"   - Overall health: {report.get('overall_health', 0):.2f}")
-    
+
+    print("OK Skill evolution analyzer works")
+    print(f"   - Skills tracked: {report.total_skills}")
+    print(f"   - Overall health: {report.overall_health:.2f}")
+
     return True
 
 
 async def main():
     """Run all tests."""
-    print("\n" + "🧪 " * 20)
-    print("Self-Improving Agent LIVE Tests")
-    print("🧪 " * 20)
-    
+    print("\nSelf-Improving Agent LIVE Tests\n")
+
     tests = [
         ("Confidence Tracking", test_confidence_tracking),
         ("Reflection Generation", test_reflection_generation),
@@ -233,7 +240,7 @@ async def main():
         ("Tool Optimizer", test_tool_optimizer),
         ("Skill Evolution", test_skill_evolution),
     ]
-    
+
     results = []
     for name, test_func in tests:
         try:
@@ -241,28 +248,28 @@ async def main():
             results.append((name, True, None))
         except Exception as e:
             results.append((name, False, str(e)))
-    
+
     # Summary
     print("\n" + "=" * 60)
-    print("📊 Test Summary")
+    print("Test Summary")
     print("=" * 60)
-    
+
     passed = sum(1 for _, success, _ in results if success)
     total = len(results)
-    
+
     for name, success, error in results:
-        status = "✅ PASS" if success else "❌ FAIL"
+        status = "PASS" if success else "FAIL"
         print(f"  {status}: {name}")
         if error:
             print(f"         Error: {error}")
-    
+
     print(f"\nTotal: {passed}/{total} tests passed")
-    
+
     if passed == total:
-        print("\n🎉 All tests passed! Self-improving features are working correctly.")
+        print("\nAll tests passed! Self-improving features are working correctly.")
     else:
-        print(f"\n⚠️  {total - passed} tests failed. Review errors above.")
-    
+        print(f"\n{total - passed} tests failed. Review errors above.")
+
     return passed == total
 
 

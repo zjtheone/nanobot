@@ -213,6 +213,7 @@ class ChannelsConfig(BaseModel):
 
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
@@ -242,7 +243,7 @@ class AgentDefaults(BaseModel):
 
 class AgentsConfig(BaseModel):
     """Multi-agent configuration."""
-    defaults: AgentConfig = Field(default_factory=lambda: AgentConfig(id="default"))
+    defaults: AgentConfig = Field(default_factory=lambda: AgentConfig())
     agent_list: list[AgentConfig] = Field(default_factory=list)
     bindings: list["AgentBinding"] = Field(default_factory=list)  # 新增：消息路由规则
     teams: list["TeamConfig"] = Field(default_factory=list)      # 新增：Agent Team 分组
@@ -340,6 +341,7 @@ class ExecToolConfig(BaseModel):
 
     timeout: int = 60
     sandbox_image: str = "python:3.12-slim"
+    path_append: str = ""
 
 
 class MCPServerConfig(BaseModel):
@@ -392,6 +394,7 @@ class ToolsConfig(BaseModel):
     restrict_to_workspace: bool = False
     agent_to_agent: AgentToAgentPolicy = Field(default_factory=AgentToAgentPolicy)
     sessions: SessionVisibilityPolicy = Field(default_factory=SessionVisibilityPolicy)
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
 class MemorySearchConfig(BaseModel):
@@ -564,33 +567,44 @@ class SubagentConfig(BaseModel):
 
 class AgentConfig(BaseModel):
     """Individual agent configuration."""
-    id: str = Field(..., min_length=1, max_length=64, description="Agent identifier")
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    id: str = Field("default", min_length=1, max_length=64, description="Agent identifier")
     name: str | None = Field(None, description="Human-readable agent name")
-    workspace: Path | None = Field(None, description="Workspace directory")
+    workspace: str = Field("~/.nanobot/workspace", description="Workspace directory")
     agent_dir: Path | None = Field(None, description="Agent state directory")
-    model: str | None = Field(None, description="Default model for this agent")
+    model: str = Field("anthropic/claude-opus-4-5", description="Default model for this agent")
     temperature: float = Field(0.7, ge=0.0, le=2.0, description="Temperature")
-    max_tokens: int = Field(4096, ge=1, description="Max tokens")
-    max_tool_iterations: int = Field(20, ge=1, description="Max tool iterations")
-    context_window: int = Field(120000, ge=1000, description="Context window in chars")
+    max_tokens: int = Field(8192, ge=1, description="Max tokens")
+    context_window_tokens: int = Field(65_536, description="Context window tokens for token-based trimming")
+    max_tool_iterations: int = Field(40, ge=1, description="Max tool iterations")
+    context_window: int = Field(200000, ge=1000, description="Context window in chars")
     auto_verify: bool = Field(True, description="Auto-verify after changes")
     auto_verify_command: str = Field("", description="Auto-verify command")
     sandbox: bool = Field(False, description="Enable sandbox mode")
     permission_mode: str = Field("auto", description="Permission mode")
     frequency_penalty: float = Field(0.0, ge=0.0, le=2.0, description="Frequency penalty")
     thinking_budget: int = Field(0, ge=0, description="Thinking budget")
-    
+    reasoning_effort: str | None = Field(None, description="Reasoning effort level (low/medium/high)")
+    # Deprecated compatibility field: accepted from old configs but ignored at runtime.
+    memory_window: int | None = Field(default=None, exclude=True)
+
     # Subagent settings
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
-    
+
     # Tool policies
-    sandbox: dict[str, Any] = Field(default_factory=dict)
+    sandbox_config: dict[str, Any] = Field(default_factory=dict)
     tools: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def should_warn_deprecated_memory_window(self) -> bool:
+        """Return True when old memoryWindow is present without contextWindowTokens."""
+        return self.memory_window is not None and "context_window_tokens" not in self.model_fields_set
     
     def get_workspace_path(self) -> Path:
         """Get resolved workspace path."""
         if self.workspace:
-            return self.workspace.expanduser()
+            return Path(self.workspace).expanduser()
         return Path.home() / ".nanobot" / f"workspace-{self.id}"
     
     def get_agent_dir_path(self) -> Path:

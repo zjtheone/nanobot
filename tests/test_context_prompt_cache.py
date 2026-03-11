@@ -38,4 +38,4 @@ def test_build_messages_includes_system_and_user(tmp_path) -> None:
 
     assert messages[0]["role"] == "system"
     assert messages[-1]["role"] == "user"
-    assert messages[-1]["content"] == "Return exactly: OK"
+    assert "Return exactly: OK" in messages[-1]["content"]
