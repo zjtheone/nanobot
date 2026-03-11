@@ -36,27 +36,45 @@ class ToolRegistry:
         return [tool.to_schema() for tool in self._tools.values()]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
-        """Execute a tool by name with given parameters."""
-        _HINT = "\n\n[Analyze the error above and try a different approach.]"
+        """
+        Execute a tool by name with given parameters.
 
+        Args:
+            name: Tool name.
+            params: Tool parameters.
+
+        Returns:
+            Tool execution result as string.
+
+        Raises:
+            KeyError: If tool not found.
+        """
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            return f"Error: Tool '{name}' not found"
 
         try:
             # Attempt to cast parameters to match schema types
             params = tool.cast_params(params)
-            
+
             # Validate parameters
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+                expected = list(tool.parameters.get("properties", {}).keys())
+                received = list(params.keys())
+                return (
+                    f"Error: Invalid parameters for tool '{name}': "
+                    + "; ".join(errors)
+                    + f". Expected: {expected}, Received: {received}"
+                )
             result = await tool.execute(**params)
-            if isinstance(result, str) and result.startswith("Error"):
-                return result + _HINT
+            # Ensure result is always a string (some tools return dict/list)
+            if not isinstance(result, str):
+                import json
+                result = json.dumps(result, ensure_ascii=False, default=str)
             return result
         except Exception as e:
-            return f"Error executing {name}: {str(e)}" + _HINT
+            return f"Error executing {name}: {str(e)}"
 
     @property
     def tool_names(self) -> list[str]:

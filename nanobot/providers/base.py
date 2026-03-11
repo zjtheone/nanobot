@@ -2,6 +2,7 @@
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,6 +31,20 @@ class LLMResponse:
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
+
+
+@dataclass
+class LLMStreamChunk:
+    """A single chunk from a streaming LLM response."""
+    delta_content: str | None = None
+    # Tool call deltas (accumulated by the caller)
+    tool_call_index: int | None = None
+    tool_call_id: str | None = None
+    tool_call_name: str | None = None
+    tool_call_arguments_delta: str | None = None
+    finish_reason: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    reasoning_content: str | None = None
 
 
 class LLMProvider(ABC):
@@ -128,7 +143,9 @@ class LLMProvider(ABC):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
         reasoning_effort: str | None = None,
+        thinking_budget: int = 0,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -157,7 +174,9 @@ class LLMProvider(ABC):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
         reasoning_effort: str | None = None,
+        thinking_budget: int = 0,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures."""
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
@@ -168,7 +187,9 @@ class LLMProvider(ABC):
                     model=model,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    frequency_penalty=frequency_penalty,
                     reasoning_effort=reasoning_effort,
+                    thinking_budget=thinking_budget,
                 )
             except asyncio.CancelledError:
                 raise
@@ -200,7 +221,9 @@ class LLMProvider(ABC):
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                frequency_penalty=frequency_penalty,
                 reasoning_effort=reasoning_effort,
+                thinking_budget=thinking_budget,
             )
         except asyncio.CancelledError:
             raise
@@ -210,7 +233,31 @@ class LLMProvider(ABC):
                 finish_reason="error",
             )
 
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
+        thinking_budget: int = 0,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """
+        Send a streaming chat completion request.
+
+        Default implementation falls back to non-streaming chat().
+        Subclasses can override for true streaming.
+        """
+        response = await self.chat(messages, tools, model, max_tokens, temperature, frequency_penalty)
+        yield LLMStreamChunk(
+            delta_content=response.content,
+            finish_reason=response.finish_reason,
+            usage=response.usage,
+        )
+
     @abstractmethod
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+

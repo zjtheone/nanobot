@@ -45,7 +45,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+    """Search the web using SerpAPI or Brave Search API."""
 
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
@@ -58,24 +58,88 @@ class WebSearchTool(Tool):
         "required": ["query"]
     }
 
-    def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None):
-        self._init_api_key = api_key
+    def __init__(
+        self,
+        api_key: str | None = None,
+        serpapi_key: str | None = None,
+        provider: str = "",
+        max_results: int = 5,
+        proxy: str | None = None,
+    ):
+        self._brave_key = api_key
+        self._serpapi_key = serpapi_key
+        self._provider = provider
         self.max_results = max_results
         self.proxy = proxy
 
     @property
-    def api_key(self) -> str:
-        """Resolve API key at call time so env/config changes are picked up."""
-        return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
+    def _resolved_provider(self) -> str:
+        """Determine which search provider to use."""
+        if self._provider:
+            return self._provider
+        # Auto-detect: prefer serpapi if key available
+        if self._serpapi_key or os.environ.get("SERPAPI_API_KEY"):
+            return "serpapi"
+        if self._brave_key or os.environ.get("BRAVE_API_KEY"):
+            return "brave"
+        return ""
+
+    @property
+    def serpapi_key(self) -> str:
+        return self._serpapi_key or os.environ.get("SERPAPI_API_KEY", "")
+
+    @property
+    def brave_key(self) -> str:
+        return self._brave_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
+        provider = self._resolved_provider
+        if provider == "serpapi":
+            return await self._search_serpapi(query, count)
+        elif provider == "brave":
+            return await self._search_brave(query, count)
+        else:
             return (
-                "Error: Brave Search API key not configured. Set it in "
-                "~/.nanobot/config.json under tools.web.search.apiKey "
-                "(or export BRAVE_API_KEY), then restart the gateway."
+                "Error: No web search API key configured. "
+                "Set serpapi_key or api_key (Brave) in ~/.nanobot/config.json under tools.web.search, "
+                "or export SERPAPI_API_KEY / BRAVE_API_KEY."
             )
 
+    async def _search_serpapi(self, query: str, count: int | None = None) -> str:
+        if not self.serpapi_key:
+            return "Error: SERPAPI_API_KEY not set."
+        try:
+            n = min(max(count or self.max_results, 1), 10)
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    "https://serpapi.com/search.json",
+                    params={
+                        "q": query,
+                        "num": n,
+                        "api_key": self.serpapi_key,
+                        "engine": "google",
+                    },
+                    timeout=15.0,
+                )
+                r.raise_for_status()
+
+            data = r.json()
+            results = data.get("organic_results", [])
+            if not results:
+                return f"No results for: {query}"
+
+            lines = [f"Results for: {query}\n"]
+            for i, item in enumerate(results[:n], 1):
+                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('link', '')}")
+                if desc := item.get("snippet"):
+                    lines.append(f"   {desc}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: {e}"
+
+    async def _search_brave(self, query: str, count: int | None = None) -> str:
+        if not self.brave_key:
+            return "Error: BRAVE_API_KEY not set."
         try:
             n = min(max(count or self.max_results, 1), 10)
             logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
@@ -83,8 +147,8 @@ class WebSearchTool(Tool):
                 r = await client.get(
                     "https://api.search.brave.com/res/v1/web/search",
                     params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
+                    headers={"Accept": "application/json", "X-Subscription-Token": self.brave_key},
+                    timeout=10.0,
                 )
                 r.raise_for_status()
 

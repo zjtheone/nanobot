@@ -201,11 +201,11 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # OpenAI Codex: uses OAuth, not API key.
     ProviderSpec(
         name="openai_codex",
-        keywords=("openai-codex",),
+        keywords=("openai_codex", "openai-codex", "codex"),
         env_key="",  # OAuth-based, no API key
         display_name="OpenAI Codex",
         litellm_prefix="",  # Not routed through LiteLLM
-        skip_prefixes=(),
+        skip_prefixes=("openai_codex/", "openai-codex/"),
         env_extras=(),
         is_gateway=False,
         is_local=False,
@@ -219,11 +219,11 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # Github Copilot: uses OAuth, not API key.
     ProviderSpec(
         name="github_copilot",
-        keywords=("github_copilot", "copilot"),
+        keywords=("github_copilot", "github-copilot", "copilot"),
         env_key="",  # OAuth-based, no API key
         display_name="Github Copilot",
         litellm_prefix="github_copilot",  # github_copilot/model → github_copilot/model
-        skip_prefixes=("github_copilot/",),
+        skip_prefixes=("github_copilot/", "github-copilot/"),
         env_extras=(),
         is_gateway=False,
         is_local=False,
@@ -357,6 +357,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="",
         detect_by_base_keyword="",
         default_api_base="",  # user must provide in config
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    # Ollama: local LLM deployment, OpenAI-compatible API.
+    # Detected when config key is "ollama" (provider_name="ollama").
+    # Uses ollama_chat/ prefix for /api/chat endpoint.
+    ProviderSpec(
+        name="ollama",
+        keywords=("ollama", "ollama_chat"),  # Match both prefixes
+        env_key="OLLAMA_API_KEY",
+        display_name="Ollama",
+        litellm_prefix="ollama_chat",  # qwen3.5:latest → ollama_chat/qwen3.5:latest
+        skip_prefixes=("ollama/", "ollama_chat/"),
+        env_extras=(),
+        is_gateway=False,
+        is_local=True,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="http://localhost:11434",  # No /v1 suffix - Ollama native API
         strip_model_prefix=False,
         model_overrides=(),
     ),

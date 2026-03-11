@@ -1,4 +1,4 @@
-"""Subagent manager for background task execution."""
+"""Subagent manager for background task execution with A2A support."""
 
 import asyncio
 import json
@@ -13,14 +13,23 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
+from nanobot.agent.announce_chain import AnnounceChainManager, AnnounceEvent, AnnounceType
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.utils.helpers import build_assistant_message
+from nanobot.session.keys import SessionKey
 
 
 class SubagentManager:
-    """Manages background subagent execution."""
+    """Manages background subagent execution with A2A support.
+
+    Features:
+    - Same-agent and cross-agent subagent spawning
+    - Nested subagent support with depth limits
+    - Session tracking and cleanup
+    - Result announcement to parent sessions
+    """
 
     def __init__(
         self,
@@ -32,11 +41,14 @@ class SubagentManager:
         max_tokens: int = 4096,
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
+        serpapi_key: str | None = None,
+        search_provider: str = "",
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
+
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -45,6 +57,8 @@ class SubagentManager:
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
+        self.serpapi_key = serpapi_key
+        self.search_provider = search_provider
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
@@ -58,14 +72,62 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        target_agent_id: str | None = None,
+        parent_depth: int = 0,
+        max_depth: int = 1,
+        max_retries: int = 0,
+        retry_delay: float = 5.0,
+        timeout: int = 0,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        Args:
+            task: Task description
+            label: Optional display label
+            origin_channel: Origin channel for announcements
+            origin_chat_id: Origin chat ID for announcements
+            session_key: Origin session key
+            target_agent_id: Target agent ID (default: same as origin)
+            parent_depth: Current spawn depth (for nested subagents)
+            max_depth: Maximum allowed spawn depth
+
+        Returns:
+            Result message (success or error)
+        """
+        # Check depth limit
+        if parent_depth >= max_depth:
+            return f"Error: Maximum spawn depth ({max_depth}) reached. Cannot spawn subagent."
+
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
+        # Build session key for the subagent
+        agent_id = target_agent_id or "default"
+        subagent_session_key = SessionKey.create_subagent(agent_id, task_id)
+
+        logger.info(
+            "Spawned subagent [{}] at depth {} (max: {}): {}",
+            task_id,
+            parent_depth + 1,
+            max_depth,
+            display_label,
+        )
+
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent_with_retry(
+                task_id=task_id,
+                task=task,
+                label=display_label,
+                origin=origin,
+                session_key=str(subagent_session_key),
+                parent_session_key=session_key,
+                depth=parent_depth + 1,
+                max_depth=max_depth,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                timeout=timeout,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -80,8 +142,99 @@ class SubagentManager:
 
         bg_task.add_done_callback(_cleanup)
 
-        logger.info("Spawned subagent [{}]: {}", task_id, display_label)
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+        depth_info = f" (depth {parent_depth + 1}/{max_depth})" if parent_depth > 0 else ""
+        return f"Subagent [{display_label}]{depth_info} started (id: {task_id}). I'll notify you when it completes."
+
+
+    async def _publish_announce_via_bus(self, task_id, label, result, status, parent_session_key):
+        """Publish announce event via MessageBus."""
+        from nanobot.bus.events import OutboundMessage
+
+        announce_msg = OutboundMessage(
+            channel="system",
+            chat_id="announce",
+            content=f"ANNOUNCE|{task_id}|{label}|{status}|{result[:500]}",
+            metadata={
+                "type": "announce",
+                "task_id": task_id,
+                "label": label,
+                "status": status,
+                "parent_session": parent_session_key,
+            }
+        )
+
+        try:
+            await self.bus.publish_outbound(announce_msg)
+            logger.debug("Published announce for task {}", task_id)
+        except Exception as e:
+            logger.error("Failed to publish announce: {}", e)
+
+    async def _run_subagent_with_retry(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict,
+        session_key: str,
+        parent_session_key: str | None,
+        depth: int,
+        max_depth: int,
+        max_retries: int = 0,
+        retry_delay: float = 5.0,
+        timeout: int = 0,
+    ) -> None:
+        """Run subagent with retry and timeout support."""
+        from nanobot.agent.team.errors import (
+            create_subagent_error,
+            is_retryable_error,
+            SubagentError,
+        )
+
+        attempt = 0
+        last_error = None
+
+        while attempt <= max_retries:
+            try:
+                if timeout > 0:
+                    await asyncio.wait_for(
+                        self._run_subagent(
+                            task_id, task, label, origin, session_key,
+                            parent_session_key, depth, max_depth,
+                        ),
+                        timeout=timeout,
+                    )
+                else:
+                    await self._run_subagent(
+                        task_id, task, label, origin, session_key,
+                        parent_session_key, depth, max_depth,
+                    )
+                return
+
+            except asyncio.TimeoutError:
+                last_error = SubagentError(
+                    error_type="timeout",
+                    message=f"Task timed out after {timeout}s",
+                    task_id=task_id,
+                    retryable=attempt < max_retries,
+                )
+
+            except Exception as e:
+                last_error = create_subagent_error(e, task_id=task_id)
+                if not is_retryable_error(e):
+                    break
+
+            if attempt >= max_retries:
+                break
+
+            delay = retry_delay * (2 ** attempt)
+            logger.warning(
+                f"Subagent [{task_id}] failed (attempt {attempt + 1}/{max_retries + 1}), "
+                f"retrying in {delay:.1f}s: {last_error.message}"
+            )
+            await asyncio.sleep(delay)
+            attempt += 1
+
+        logger.error(f"Subagent [{task_id}] failed after {attempt} attempts: {last_error}")
 
     async def _run_subagent(
         self,
@@ -89,28 +242,57 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        session_key: str,
+        parent_session_key: str | None,
+        depth: int,
+        max_depth: int,
     ) -> None:
-        """Execute the subagent task and announce the result."""
-        logger.info("Subagent [{}] starting task: {}", task_id, label)
+        """Execute the subagent task and announce the result.
+
+        Args:
+            task_id: Unique task ID
+            task: Task description
+            label: Display label
+            origin: Origin channel/chat_id
+            session_key: This subagent's session key
+            parent_session_key: Parent session key
+            depth: Current depth
+            max_depth: Maximum depth
+        """
+        logger.info("Subagent [{}] starting task at depth {}: {}", task_id, depth, label)
 
         try:
-            # Build subagent tools (no message tool, no spawn tool)
+            # Build subagent tools (no message tool, no spawn tool if at max depth)
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
+            tools.register(
+                ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                )
+            )
+            tools.register(WebSearchTool(
+                api_key=self.brave_api_key,
+                serpapi_key=self.serpapi_key,
+                provider=self.search_provider,
+                proxy=self.web_proxy,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
-            system_prompt = self._build_subagent_prompt()
+
+            # Allow spawn tool only if not at max depth
+            if depth < max_depth:
+                from nanobot.agent.tools.spawn import SpawnTool
+
+                spawn_tool = SpawnTool(self)
+                tools.register(spawn_tool)
+
+            # Build messages with subagent-specific prompt
+            system_prompt = self._build_subagent_prompt(task, depth, max_depth)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -155,14 +337,21 @@ class SubagentManager:
                     # Execute tools
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                        logger.debug(
+                            "Subagent [{}] executing: {} with arguments: {}",
+                            task_id,
+                            tool_call.name,
+                            args_str,
+                        )
                         result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "content": result,
+                            }
+                        )
                 else:
                     final_result = response.content
                     break
@@ -170,13 +359,33 @@ class SubagentManager:
             if final_result is None:
                 final_result = "Task completed but no final response was generated."
 
-            logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+            logger.info("Subagent [{}] completed successfully at depth {}", task_id, depth)
+            await self._announce_result(
+                task_id=task_id,
+                label=label,
+                task=task,
+                result=final_result,
+                origin=origin,
+                status="ok",
+                depth=depth,
+                session_key=session_key,
+                parent_session_key=parent_session_key,
+            )
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
-            logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, error_msg, origin, "error")
+            logger.error("Subagent [{}] failed at depth {}: {}", task_id, depth, e)
+            await self._announce_result(
+                task_id=task_id,
+                label=label,
+                task=task,
+                result=error_msg,
+                origin=origin,
+                status="error",
+                depth=depth,
+                session_key=session_key,
+                parent_session_key=parent_session_key,
+            )
 
     async def _announce_result(
         self,
@@ -186,11 +395,27 @@ class SubagentManager:
         result: str,
         origin: dict[str, str],
         status: str,
+        depth: int,
+        session_key: str,
+        parent_session_key: str | None,
     ) -> None:
-        """Announce the subagent result to the main agent via the message bus."""
-        status_text = "completed successfully" if status == "ok" else "failed"
+        """Announce the subagent result to the parent session.
 
-        announce_content = f"""[Subagent '{label}' {status_text}]
+        Args:
+            task_id: Task ID
+            label: Display label
+            task: Task description
+            result: Result message
+            origin: Origin channel/chat_id
+            status: "ok" or "error"
+            depth: Spawn depth
+            session_key: This subagent's session key
+            parent_session_key: Parent session key
+        """
+        status_text = "completed successfully" if status == "ok" else "failed"
+        depth_info = f" (depth {depth})" if depth > 1 else ""
+
+        announce_content = f"""[Subagent '{label}'{depth_info} {status_text}]
 
 Task: {task}
 
@@ -205,23 +430,75 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata={
+                "task_id": task_id,
+                "session_key": session_key,
+                "parent_session_key": parent_session_key,
+                "depth": depth,
+            },
         )
 
         await self.bus.publish_inbound(msg)
-        logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
-    
-    def _build_subagent_prompt(self) -> str:
-        """Build a focused system prompt for the subagent."""
+        logger.debug(
+            "Subagent [{}] announced result to {}:{}", task_id, origin["channel"], origin["chat_id"]
+        )
+
+    def _build_subagent_prompt(self, task: str, depth: int, max_depth: int) -> str:
+        """Build a focused system prompt for the subagent.
+
+        Args:
+            task: Task description
+            depth: Current depth
+            max_depth: Maximum depth
+
+        Returns:
+            System prompt
+        """
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
+        from datetime import datetime
+        import time as _time
 
-        time_ctx = ContextBuilder._build_runtime_context(None, None)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tz = _time.strftime("%Z") or "UTC"
+        time_ctx = f"Current Time: {now} ({tz})"
+
+        can_spawn = (
+            "Yes - you can spawn your own subagents"
+            if depth < max_depth
+            else "No - maximum depth reached"
+        )
+
         parts = [f"""# Subagent
 
 {time_ctx}
 
+## Spawn Depth
+You are at depth {depth} of {max_depth}.
+
+## Can You Spawn Subagents?
+{can_spawn}
+
 You are a subagent spawned by the main agent to complete a specific task.
-Stay focused on the assigned task. Your final response will be reported back to the main agent.
+
+## Rules
+1. Stay focused - complete only the assigned task, nothing else
+2. Your final result will be reported back to the parent agent
+3. Do not initiate conversations or take on side tasks
+4. Be concise but informative in your findings
+5. If you can spawn subagents (depth < max), use them for parallel tasks
+
+## What You Can Do
+- Read and write files in the workspace
+- Execute shell commands
+- Search the web and fetch web pages
+- Complete the task thoroughly
+- {"Spawn subagents for parallel work" if depth < max_depth else "Cannot spawn subagents (max depth reached)"}
+
+## What You Cannot Do
+- Send messages directly to users (no message tool available)
+- Access the main agent's conversation history
+- {"Spawn more subagents" if depth >= max_depth else ""}
 
 ## Workspace
 {self.workspace}"""]
@@ -230,12 +507,24 @@ Stay focused on the assigned task. Your final response will be reported back to 
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 
+        parts.append("\nWhen you have completed the task, provide a clear summary of your findings or actions.")
+
         return "\n\n".join(parts)
-    
+
     async def cancel_by_session(self, session_key: str) -> int:
-        """Cancel all subagents for the given session. Returns count cancelled."""
-        tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])
-                 if tid in self._running_tasks and not self._running_tasks[tid].done()]
+        """Cancel all subagents for the given session.
+
+        Args:
+            session_key: Session key
+
+        Returns:
+            Count of cancelled tasks
+        """
+        tasks = [
+            self._running_tasks[tid]
+            for tid in self._session_tasks.get(session_key, [])
+            if tid in self._running_tasks and not self._running_tasks[tid].done()
+        ]
         for t in tasks:
             t.cancel()
         if tasks:
@@ -245,3 +534,22 @@ Stay focused on the assigned task. Your final response will be reported back to 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
+
+    def get_task_info(self, task_id: str) -> dict[str, Any] | None:
+        """Get information about a running task.
+
+        Args:
+            task_id: Task ID
+
+        Returns:
+            Task info dict or None if not found
+        """
+        task = self._running_tasks.get(task_id)
+        if not task:
+            return None
+
+        return {
+            "task_id": task_id,
+            "done": task.done(),
+            "cancelled": task.cancelled(),
+        }

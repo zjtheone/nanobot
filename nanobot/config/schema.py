@@ -1,29 +1,24 @@
+from __future__ import annotations
+
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 
-class Base(BaseModel):
-    """Base model that accepts both camelCase and snake_case keys."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-class WhatsAppConfig(Base):
+class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
     bridge_url: str = "ws://localhost:3001"
-    bridge_token: str = ""  # Shared token for bridge auth (optional, recommended)
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
-class TelegramConfig(Base):
+class TelegramConfig(BaseModel):
     """Telegram channel configuration."""
 
     enabled: bool = False
@@ -36,7 +31,7 @@ class TelegramConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"  # "mention" responds when @mentioned or replied to, "open" responds to all
 
 
-class FeishuConfig(Base):
+class FeishuConfig(BaseModel):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
     enabled: bool = False
@@ -50,7 +45,7 @@ class FeishuConfig(Base):
     )
 
 
-class DingTalkConfig(Base):
+class DingTalkConfig(BaseModel):
     """DingTalk channel configuration using Stream mode."""
 
     enabled: bool = False
@@ -59,7 +54,7 @@ class DingTalkConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
-class DiscordConfig(Base):
+class DiscordConfig(BaseModel):
     """Discord channel configuration."""
 
     enabled: bool = False
@@ -70,7 +65,7 @@ class DiscordConfig(Base):
     group_policy: Literal["mention", "open"] = "mention"
 
 
-class MatrixConfig(Base):
+class MatrixConfig(BaseModel):
     """Matrix (Element) channel configuration."""
 
     enabled: bool = False
@@ -91,7 +86,7 @@ class MatrixConfig(Base):
     allow_room_mentions: bool = False
 
 
-class EmailConfig(Base):
+class EmailConfig(BaseModel):
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
     enabled: bool = False
@@ -125,19 +120,19 @@ class EmailConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed sender email addresses
 
 
-class MochatMentionConfig(Base):
+class MochatMentionConfig(BaseModel):
     """Mochat mention behavior configuration."""
 
     require_in_groups: bool = False
 
 
-class MochatGroupRule(Base):
+class MochatGroupRule(BaseModel):
     """Mochat per-group mention requirement."""
 
     require_mention: bool = False
 
 
-class MochatConfig(Base):
+class MochatConfig(BaseModel):
     """Mochat channel configuration."""
 
     enabled: bool = False
@@ -164,7 +159,7 @@ class MochatConfig(Base):
     reply_delay_ms: int = 120000
 
 
-class SlackDMConfig(Base):
+class SlackDMConfig(BaseModel):
     """Slack DM policy configuration."""
 
     enabled: bool = True
@@ -172,7 +167,7 @@ class SlackDMConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed Slack user IDs
 
 
-class SlackConfig(Base):
+class SlackConfig(BaseModel):
     """Slack channel configuration."""
 
     enabled: bool = False
@@ -189,7 +184,7 @@ class SlackConfig(Base):
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
-class QQConfig(Base):
+class QQConfig(BaseModel):
     """QQ channel configuration using botpy SDK."""
 
     enabled: bool = False
@@ -200,9 +195,7 @@ class QQConfig(Base):
     )  # Allowed user openids (empty = public access)
 
 
-
-
-class ChannelsConfig(Base):
+class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
 
     send_progress: bool = True  # stream agent's text progress to the channel
@@ -216,10 +209,9 @@ class ChannelsConfig(Base):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
-    matrix: MatrixConfig = Field(default_factory=MatrixConfig)
 
 
-class AgentDefaults(Base):
+class AgentDefaults(BaseModel):
     """Default agent configuration."""
 
     workspace: str = "~/.nanobot/workspace"
@@ -229,8 +221,15 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
-    temperature: float = 0.1
+    temperature: float = 0.7
+    frequency_penalty: float = 0.0
     max_tool_iterations: int = 40
+    context_window: int = 200000  # chars (~50K tokens), trim old tool results when exceeded
+    auto_verify: bool = True  # Auto-run build/test after code changes
+    auto_verify_command: str = ""  # Custom verify command (empty = auto-detect project type)
+    sandbox: bool = False  # Enable Docker sandbox for execution
+    permission_mode: str = "auto"  # auto | confirm_writes | confirm_all | yolo
+    thinking_budget: int = 0  # Extended thinking token budget (0 = disabled)
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
@@ -241,13 +240,45 @@ class AgentDefaults(Base):
         return self.memory_window is not None and "context_window_tokens" not in self.model_fields_set
 
 
-class AgentsConfig(Base):
-    """Agent configuration."""
+class AgentsConfig(BaseModel):
+    """Multi-agent configuration."""
+    defaults: AgentConfig = Field(default_factory=lambda: AgentConfig(id="default"))
+    agent_list: list[AgentConfig] = Field(default_factory=list)
+    bindings: list["AgentBinding"] = Field(default_factory=list)  # 新增：消息路由规则
+    teams: list["TeamConfig"] = Field(default_factory=list)      # 新增：Agent Team 分组
+    default_agent: str = "default"                                # 新增：默认 agent ID
+    
+    def get_agent(self, agent_id: str) -> AgentConfig:
+        """Get agent config by ID, falling back to defaults."""
+        for agent in self.agent_list:
+            if agent.id == agent_id:
+                return agent
+        # Return defaults with overridden id
+        default = self.defaults.model_copy()
+        default.id = agent_id
+        return default
+    
+    def has_agent(self, agent_id: str) -> bool:
+        """Check if an agent is configured."""
+        return any(a.id == agent_id for a in self.agent_list)
+    
+    def list_agent_ids(self) -> list:
+        """Get list of configured agent IDs."""
+        return [a.id for a in self.agent_list]
+    
+    def get_team(self, name: str) -> "TeamConfig | None":
+        """Get team config by name."""
+        for team in self.teams:
+            if team.name == name:
+                return team
+        return None
+    
+    def list_teams(self) -> list["TeamConfig"]:
+        """Get list of configured teams."""
+        return self.teams
 
-    defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
-
-class ProviderConfig(Base):
+class ProviderConfig(BaseModel):
     """LLM provider configuration."""
 
     api_key: str = ""
@@ -255,7 +286,7 @@ class ProviderConfig(Base):
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
-class ProvidersConfig(Base):
+class ProvidersConfig(BaseModel):
     """Configuration for LLM providers."""
 
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
@@ -276,31 +307,26 @@ class ProvidersConfig(Base):
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local LLM
 
 
-class HeartbeatConfig(Base):
-    """Heartbeat service configuration."""
-
-    enabled: bool = True
-    interval_s: int = 30 * 60  # 30 minutes
-
-
-class GatewayConfig(Base):
+class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
-    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
-class WebSearchConfig(Base):
+class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
 
+    provider: str = ""  # "serpapi", "brave", or "" (auto-detect from available keys)
     api_key: str = ""  # Brave Search API key
+    serpapi_key: str = ""  # SerpAPI key
     max_results: int = 5
 
 
-class WebToolsConfig(Base):
+class WebToolsConfig(BaseModel):
     """Web tools configuration."""
 
     proxy: str | None = (
@@ -309,14 +335,14 @@ class WebToolsConfig(Base):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
-class ExecToolConfig(Base):
+class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
 
     timeout: int = 60
-    path_append: str = ""
+    sandbox_image: str = "python:3.12-slim"
 
 
-class MCPServerConfig(Base):
+class MCPServerConfig(BaseModel):
     """MCP server connection configuration (stdio or HTTP)."""
 
     type: Literal["stdio", "sse", "streamableHttp"] | None = None  # auto-detected if omitted
@@ -326,15 +352,100 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
+    enabled: bool = True
 
 
-class ToolsConfig(Base):
-    """Tools configuration."""
+class AgentToAgentPolicy(BaseModel):
+    """Agent-to-Agent communication policy."""
+    enabled: bool = False  # Enable/disable A2A communication
+    allow: list[str] = Field(default_factory=list)  # Allowed agent IDs ("*" for all)
+    deny: list[str] = Field(default_factory=list)  # Denied agent IDs
+    max_ping_pong_turns: int = 5  # Maximum automatic ping-pong turns
+
+
+class SessionVisibilityPolicy(BaseModel):
+    """Session visibility policy for tools."""
+    visibility: str = "tree"  # self | tree | agent | all
+    
+    @property
+    def is_self(self) -> bool:
+        return self.visibility == "self"
+    
+    @property
+    def is_tree(self) -> bool:
+        return self.visibility == "tree"
+    
+    @property
+    def is_agent(self) -> bool:
+        return self.visibility == "agent"
+    
+    @property
+    def is_all(self) -> bool:
+        return self.visibility == "all"
+
+
+class ToolsConfig(BaseModel):
+    """Tools configuration with A2A support."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
-    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    restrict_to_workspace: bool = False
+    agent_to_agent: AgentToAgentPolicy = Field(default_factory=AgentToAgentPolicy)
+    sessions: SessionVisibilityPolicy = Field(default_factory=SessionVisibilityPolicy)
+
+
+class MemorySearchConfig(BaseModel):
+    """Memory search configuration."""
+
+    enabled: bool = True
+    max_distance: float = 0.4
+    hybrid_weight: float = 0.5
+    top_k: int = 10
+    use_embedding_fallback: bool = True
+    embedding_provider: str = "openai"  # openai, gemini, llama
+    openai_api_key: str = ""
+    openai_api_base: str = ""
+    openai_model: str = "text-embedding-3-small"
+    gemini_api_key: str = ""
+    gemini_model: str = "models/text-embedding-004"
+    llama_model_path: str = ""
+    llama_n_gpu_layers: int = -1
+    storage_path: str = "memory/vector"
+    # File watching configuration
+    watch_paths: list[str] = Field(default_factory=lambda: ["memory"])
+    watch_interval: float = 5.0
+    # Chunking configuration
+    chunk_size: int = 20  # lines per chunk
+    chunk_overlap: int = 0  # lines overlap between chunks
+    chunk_boundary: str = "line"  # "line", "paragraph", "sentence", "markdown_heading", "semantic"
+    semantic_boundary_threshold: float = 0.7  # similarity threshold for semantic segmentation
+    # Enhanced hybrid search options
+    query_parser_enabled: bool = True
+    keyword_weight: float = 0.4
+    vector_weight: float = 0.6
+    rerank_method: str = "none"  # "none", "similarity", "cross_encoder"
+    rerank_top_k: int = 20
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    score_normalization: bool = True
+    score_rescaling: bool = False
+    # Embedding provider configuration
+    embedding_fallback_chain: list[str] = Field(
+        default_factory=lambda: ["openai", "gemini", "sentence_transformer", "local_llama", "none"]
+    )
+    sentence_transformer_model: str = "all-MiniLM-L6-v2"
+    embedding_cache_size: int = 1000
+    # Vector search backend configuration
+    vector_search_backend: str = "sqlite-vec"  # "sqlite-vec", "sqlite-vss", "none"
+    sqlite_vss_extension_path: str = ""
+    # Reranker fine-tuning
+    reranker_device: str = "cpu"  # "cpu", "cuda", "mps"
+    reranker_max_length: int = 512
+
+
+class MCPConfig(BaseModel):
+    """MCP (Model Context Protocol) configuration."""
+
+    servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
 class Config(BaseSettings):
@@ -345,6 +456,8 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory_search: MemorySearchConfig = Field(default_factory=MemorySearchConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     @property
     def workspace_path(self) -> Path:
@@ -355,41 +468,45 @@ class Config(BaseSettings):
         self, model: str | None = None
     ) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
-        from nanobot.providers.registry import PROVIDERS
-
-        forced = self.agents.defaults.provider
-        if forced != "auto":
-            p = getattr(self.providers, forced, None)
-            return (p, forced) if p else (None, None)
+        from nanobot.providers.registry import PROVIDERS, find_by_name
 
         model_lower = (model or self.agents.defaults.model).lower()
-        model_normalized = model_lower.replace("-", "_")
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")
 
-        def _kw_matches(kw: str) -> bool:
-            kw = kw.lower()
-            return kw in model_lower or kw.replace("-", "_") in model_normalized
-
-        # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
+        # Prefer explicit provider prefix match (e.g., "github-copilot/" -> github_copilot)
+        # Also handle variations like "ollama_chat" -> "ollama"
         for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
-            if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or p.api_key:
+            if model_prefix and normalized_prefix == spec.name:
+                p = getattr(self.providers, spec.name, None)
+                # OAuth providers don't need api_key
+                if spec.is_oauth:
+                    return p or ProviderConfig(), spec.name
+                if p and p.api_key:
+                    return p, spec.name
+            # Handle "ollama_chat" -> "ollama" pattern
+            if model_prefix and normalized_prefix == spec.name + "_chat":
+                p = getattr(self.providers, spec.name, None)
+                if spec.is_oauth:
+                    return p or ProviderConfig(), spec.name
+                if p and p.api_key:
                     return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
-            if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or p.api_key:
+            if p and any(
+                kw in model_lower or kw.replace("-", "_") in model_lower.replace("-", "_")
+                for kw in spec.keywords
+            ):
+                # OAuth providers don't need api_key
+                if spec.is_oauth:
+                    return p or ProviderConfig(), spec.name
+                if p.api_key:
                     return p, spec.name
 
         # Fallback: gateways first, then others (follows registry order)
-        # OAuth providers are NOT valid fallbacks — they require explicit model selection
         for spec in PROVIDERS:
-            if spec.is_oauth:
-                continue
             p = getattr(self.providers, spec.name, None)
             if p and p.api_key:
                 return p, spec.name
@@ -427,3 +544,80 @@ class Config(BaseSettings):
         return None
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
+
+
+# ============================================================================
+# Agent-to-Agent Configuration Models
+# ============================================================================
+
+class SubagentConfig(BaseModel):
+    """Subagent configuration."""
+    model: str | None = None  # Override model for subagents
+    temperature: float | None = None  # Override temperature
+    max_tokens: int | None = None  # Override max_tokens
+    max_spawn_depth: int = 1  # Maximum spawn depth (1=no nesting, 2=orchestrator pattern)
+    max_children_per_agent: int = 5  # Max active children per agent session
+    max_concurrent: int = 8  # Global concurrency limit
+    run_timeout_seconds: int = 0  # Default timeout (0=no timeout)
+    archive_after_minutes: int = 60  # Auto-archive after N minutes
+
+
+class AgentConfig(BaseModel):
+    """Individual agent configuration."""
+    id: str = Field(..., min_length=1, max_length=64, description="Agent identifier")
+    name: str | None = Field(None, description="Human-readable agent name")
+    workspace: Path | None = Field(None, description="Workspace directory")
+    agent_dir: Path | None = Field(None, description="Agent state directory")
+    model: str | None = Field(None, description="Default model for this agent")
+    temperature: float = Field(0.7, ge=0.0, le=2.0, description="Temperature")
+    max_tokens: int = Field(4096, ge=1, description="Max tokens")
+    max_tool_iterations: int = Field(20, ge=1, description="Max tool iterations")
+    context_window: int = Field(120000, ge=1000, description="Context window in chars")
+    auto_verify: bool = Field(True, description="Auto-verify after changes")
+    auto_verify_command: str = Field("", description="Auto-verify command")
+    sandbox: bool = Field(False, description="Enable sandbox mode")
+    permission_mode: str = Field("auto", description="Permission mode")
+    frequency_penalty: float = Field(0.0, ge=0.0, le=2.0, description="Frequency penalty")
+    thinking_budget: int = Field(0, ge=0, description="Thinking budget")
+    
+    # Subagent settings
+    subagents: SubagentConfig = Field(default_factory=SubagentConfig)
+    
+    # Tool policies
+    sandbox: dict[str, Any] = Field(default_factory=dict)
+    tools: dict[str, Any] = Field(default_factory=dict)
+    
+    def get_workspace_path(self) -> Path:
+        """Get resolved workspace path."""
+        if self.workspace:
+            return self.workspace.expanduser()
+        return Path.home() / ".nanobot" / f"workspace-{self.id}"
+    
+    def get_agent_dir_path(self) -> Path:
+        """Get resolved agent directory path."""
+        if self.agent_dir:
+            return self.agent_dir.expanduser()
+        return Path.home() / ".nanobot" / "agents" / self.id / "agent"
+
+
+
+# ============================================================================
+# Agent Team Configuration Models
+# ============================================================================
+
+class AgentBinding(BaseModel):
+    """消息路由规则：将特定 channel/chat 绑定到特定 agent。"""
+    agent_id: str                          # 目标 agent ID
+    channels: list[str] = Field(default_factory=list)  # 匹配的 channel 名称列表，如 ["telegram", "slack"]
+    chat_ids: list[str] = Field(default_factory=list)   # 匹配的 chat_id 列表
+    chat_pattern: str | None = None        # chat_id 正则匹配
+    keywords: list[str] = Field(default_factory=list)   # 消息内容关键词匹配
+    priority: int = 0                      # 优先级，越大越优先
+
+
+class TeamConfig(BaseModel):
+    """Agent Team 分组定义。"""
+    name: str                              # team 名称
+    members: list[str]                     # agent IDs
+    leader: str | None = None              # leader agent（可选）
+    strategy: str = "parallel"             # parallel | sequential | leader_delegate

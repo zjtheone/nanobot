@@ -45,6 +45,22 @@ async def test_start_is_idempotent(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_disabled(tmp_path) -> None:
+    provider = DummyProvider([])
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="test-model",
+        interval_s=9999,
+        enabled=False,
+    )
+
+    await service.start()
+    assert service._task is None
+
+
+@pytest.mark.asyncio
 async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
     provider = DummyProvider([LLMResponse(content="no tool call", tool_calls=[])])
     service = HeartbeatService(

@@ -306,8 +306,13 @@ def gateway(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    multi: bool = typer.Option(False, "--multi", "-m", help="Enable multi-agent routing"),
+    interactive: bool = typer.Option(False, "--interactive", "-i", help="Enable interactive CLI mode"),
 ):
-    """Start the nanobot gateway."""
+    """Start the nanobot gateway.
+
+    Use --multi to enable multi-agent mode with message routing based on bindings.
+    """
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
@@ -328,8 +333,72 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
+
+    # Multi-agent mode
+    if multi:
+        from loguru import logger
+        from nanobot.gateway.manager import MultiAgentGateway
+
+        console.print(
+            f"{__logo__} Starting nanobot gateway in MULTI-AGENT mode on port {port}..."
+        )
+        console.print(f"[cyan]Configured agents:[/cyan] {config.agents.list_agent_ids()}")
+        console.print(f"[cyan]Default agent:[/cyan] {config.agents.default_agent}")
+        console.print(f"[cyan]Routing rules:[/cyan] {len(config.agents.bindings)}")
+
+        gw = MultiAgentGateway(config, bus)
+
+        async def run_multi_agent_gateway():
+            await gw.start()
+
+            async def on_cron_job(job: CronJob) -> str | None:
+                agent = gw.get_agent(config.agents.default_agent)
+                if not agent:
+                    logger.error("Default agent not found for cron job")
+                    return None
+                response = await agent.process_direct(
+                    job.payload.message,
+                    session_key=f"cron:{job.id}",
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to or "direct",
+                )
+                if job.payload.deliver and job.payload.to:
+                    from nanobot.bus.events import OutboundMessage
+                    await bus.publish_outbound(
+                        OutboundMessage(
+                            channel=job.payload.channel or "cli",
+                            chat_id=job.payload.to,
+                            content=response or "",
+                        )
+                    )
+                return response
+
+            cron.on_job = on_cron_job
+            channels = ChannelManager(config, bus)
+            if channels.enabled_channels:
+                console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+
+            if interactive:
+                console.print("\n[cyan]✓[/cyan] Interactive CLI enabled")
+                asyncio.create_task(gw.run_interactive_cli())
+
+            try:
+                await cron.start()
+                await channels.start_all()
+                while True:
+                    await asyncio.sleep(1)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                console.print("\nShutting down...")
+                cron.stop()
+                await gw.stop()
+                await channels.stop_all()
+
+        asyncio.run(run_multi_agent_gateway())
+        return
+
+    # Single agent mode
+    provider = _make_provider(config)
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
@@ -497,6 +566,10 @@ def agent(
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream agent output in real-time"),
+    sandbox: bool = typer.Option(False, "--sandbox", help="Enable Docker sandbox mode"),
+    max_iterations: int = typer.Option(None, "--max-iterations", help="Maximum number of tool iterations"),
+    image: list[str] = typer.Option(None, "--image", "-i", help="Image file path(s) for multimodal input"),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -529,16 +602,24 @@ def agent(
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
+        max_iterations=max_iterations or config.agents.defaults.max_tool_iterations,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        frequency_penalty=config.agents.defaults.frequency_penalty,
         brave_api_key=config.tools.web.search.api_key or None,
+        serpapi_key=config.tools.web.search.serpapi_key or None,
+        search_provider=config.tools.web.search.provider,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        sandbox=sandbox or config.agents.defaults.sandbox,
+        permission_mode=config.agents.defaults.permission_mode,
+        thinking_budget=config.agents.defaults.thinking_budget,
+        memory_search_config=config.memory_search.model_dump() if config.memory_search else None,
+        agents_config=config.agents,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -984,6 +1065,103 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+# ============================================================================
+# Session Commands
+# ============================================================================
+
+session_app = typer.Typer(help="Manage conversation sessions")
+app.add_typer(session_app, name="session")
+
+@session_app.command("list")
+def session_list():
+    """List conversation sessions."""
+    from nanobot.config.loader import load_config
+    from nanobot.session.manager import SessionManager
+    from datetime import datetime
+
+    config = load_config()
+    session_manager = SessionManager(config.workspace_path)
+    sessions = session_manager.list_sessions()
+
+    if not sessions:
+        console.print("No sessions found.")
+        return
+
+    table = Table(title="Conversation Sessions")
+    table.add_column("Session ID", style="cyan")
+    table.add_column("Created At", style="magenta")
+    table.add_column("Updated At", style="green")
+
+    for s in sessions:
+        created = s.get("created_at", "")
+        updated = s.get("updated_at", "")
+
+        if created:
+            try:
+                created = datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+        if updated:
+            try:
+                updated = datetime.fromisoformat(updated).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+
+        table.add_row(s["key"], created, updated)
+
+    console.print(table)
+
+
+@session_app.command("show")
+def session_show(
+    session_id: str = typer.Argument(..., help="Session ID to show"),
+):
+    """Show detailed information about a specific session."""
+    from nanobot.session.manager import SessionManager
+    from nanobot.config.loader import load_config
+    from datetime import datetime
+
+    config = load_config()
+    manager = SessionManager(config.workspace_path)
+    session = manager._load(session_id)
+
+    if not session:
+        console.print(f"[red]Session {session_id} not found[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold cyan]Session Details: {session_id}[/bold cyan]")
+    console.print(f"Created At: [magenta]{session.created_at.strftime('%Y-%m-%d %H:%M:%S')}[/magenta]")
+    console.print(f"Updated At: [green]{session.updated_at.strftime('%Y-%m-%d %H:%M:%S')}[/green]")
+    console.print(f"Message Count: {len(session.messages)}")
+
+    if session.metadata:
+        console.print("\n[bold]Metadata:[/bold]")
+        for k, v in session.metadata.items():
+            console.print(f"  {k}: {v}")
+
+    if session.messages:
+        console.print("\n[bold]Last 5 Messages:[/bold]")
+        last_messages = session.messages[-5:]
+        for msg in last_messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            timestamp = msg.get("timestamp", "")
+            if timestamp:
+                try:
+                    timestamp = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+                except Exception:
+                    pass
+
+            color = "blue" if role == "user" else "green" if role == "assistant" else "yellow"
+            # Truncate content for display
+            display_content = content.strip().replace("\n", " ")
+            if len(display_content) > 150:
+                display_content = display_content[:147] + "..."
+
+            console.print(f"[[dim]{timestamp}[/dim]] [bold {color}]{role.capitalize()}:[/bold {color}] {display_content}")
+    console.print()
 
 
 if __name__ == "__main__":
