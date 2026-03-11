@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -234,6 +234,14 @@ class AgentDefaults(BaseModel):
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+
+    @field_validator("sandbox", mode="before")
+    @classmethod
+    def _coerce_sandbox(cls, v: Any) -> bool:
+        """Accept legacy dict value (e.g. {}) and treat it as False."""
+        if isinstance(v, dict):
+            return bool(v)
+        return v
 
     @property
     def should_warn_deprecated_memory_window(self) -> bool:
@@ -582,6 +590,14 @@ class AgentConfig(BaseModel):
     auto_verify: bool = Field(True, description="Auto-verify after changes")
     auto_verify_command: str = Field("", description="Auto-verify command")
     sandbox: bool = Field(False, description="Enable sandbox mode")
+
+    @field_validator("sandbox", mode="before")
+    @classmethod
+    def _coerce_sandbox(cls, v: Any) -> bool:
+        """Accept legacy dict value (e.g. {}) and treat it as False."""
+        if isinstance(v, dict):
+            return bool(v)  # {} -> False, {"enabled": True} -> True
+        return v
     permission_mode: str = Field("auto", description="Permission mode")
     frequency_penalty: float = Field(0.0, ge=0.0, le=2.0, description="Frequency penalty")
     thinking_budget: int = Field(0, ge=0, description="Thinking budget")
