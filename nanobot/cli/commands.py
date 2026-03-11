@@ -1329,6 +1329,12 @@ try:
 except ImportError:
     pass
 
+try:
+    from nanobot.cli.teams import app as teams_app
+    app.add_typer(teams_app, name="teams", help="Manage agent teams")
+except ImportError:
+    pass
+
 
 if __name__ == "__main__":
     app()
