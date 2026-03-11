@@ -901,6 +901,29 @@ def cron_enable(
         console.print(f"[red]Job {job_id} not found[/red]")
 
 
+@cron_app.command("run")
+def cron_run(
+    job_id: str = typer.Argument(..., help="Job ID to run"),
+    force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
+):
+    """Manually run a job."""
+    import asyncio
+
+    from nanobot.config.paths import get_cron_dir
+    from nanobot.cron.service import CronService
+
+    store_path = get_cron_dir() / "jobs.json"
+    service = CronService(store_path)
+
+    async def run():
+        return await service.run_job(job_id, force=force)
+
+    if asyncio.run(run()):
+        console.print(f"[green]✓[/green] Job executed")
+    else:
+        console.print(f"[red]Failed to run job {job_id}[/red]")
+
+
 # ============================================================================
 # Channel Commands
 # ============================================================================
