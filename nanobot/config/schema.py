@@ -209,6 +209,7 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    matrix: MatrixConfig = Field(default_factory=MatrixConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -319,11 +320,19 @@ class ProvidersConfig(BaseModel):
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local LLM
 
 
+class HeartbeatConfig(BaseModel):
+    """Heartbeat service configuration."""
+
+    enabled: bool = False
+    interval_s: int = 3600  # Default: 1 hour
+
+
 class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
 class WebSearchConfig(BaseModel):
