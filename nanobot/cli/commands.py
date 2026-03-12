@@ -282,6 +282,10 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     loaded = load_config(config_path)
     if workspace:
         loaded.agents.defaults.workspace = workspace
+        # Also override workspace for all agents in agent_list so that
+        # multi-agent mode (-m) respects the CLI -w flag.
+        for agent_cfg in loaded.agents.agent_list:
+            agent_cfg.workspace = workspace
     return loaded
 
 

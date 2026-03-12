@@ -222,6 +222,10 @@ class ChannelManager:
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
 
+                # Skip internal channels that are not meant for external delivery
+                if msg.channel in ("a2a", "system", "internal"):
+                    continue
+
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:

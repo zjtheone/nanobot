@@ -2017,7 +2017,11 @@ Respond with ONLY valid JSON, no markdown fences."""
             },
         )
 
-        response = await self._process_message(inbound)
+        # Use a unique session key per A2A request to avoid history
+        # contamination across different tasks. Include the message_id so
+        # each top-level orchestrator request gets a fresh conversation.
+        a2a_session_key = f"a2a:{a2a_msg.from_agent}:{a2a_msg.message_id}"
+        response = await self._process_message(inbound, session_key=a2a_session_key)
 
         if response and a2a_msg.type == MessageType.REQUEST:
             try:
