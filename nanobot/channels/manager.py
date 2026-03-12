@@ -133,6 +133,7 @@ class ChannelManager:
                 self.channels["qq"] = QQChannel(
                     self.config.channels.qq,
                     self.bus,
+                    groq_api_key=self.config.providers.groq.api_key,
                 )
                 logger.info("QQ channel enabled")
             except ImportError as e:

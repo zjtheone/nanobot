@@ -193,6 +193,8 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(
         default_factory=list
     )  # Allowed user openids (empty = public access)
+    voice_reply: bool = False  # Reply with voice when receiving voice messages
+    tts_voice: str = "zh-CN-XiaoxiaoNeural"  # Edge TTS voice for voice replies
 
 
 class ChannelsConfig(BaseModel):

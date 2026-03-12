@@ -42,6 +42,7 @@ class GatewayHTTPServer:
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/agents", self.handle_agents)
         self.app.router.add_get("/agents/{agent_id}", self.handle_agent_detail)
+        self.app.router.add_get("/media/{filename}", self.handle_media)
 
     async def handle_chat(self, request: web.Request) -> web.Response:
         """Handle chat message requests.
@@ -135,6 +136,33 @@ class GatewayHTTPServer:
             return web.json_response(agent.get_runtime_status())
         return web.json_response({"agent_id": agent_id, "running": getattr(agent, "_running", False)})
 
+    async def handle_media(self, request: web.Request) -> web.Response:
+        """Serve temporary media files (e.g. voice silk files for QQ upload)."""
+        from nanobot.config.paths import get_media_dir
+
+        filename = request.match_info["filename"]
+        # Prevent path traversal
+        if "/" in filename or "\\" in filename or ".." in filename:
+            return web.json_response({"error": "invalid filename"}, status=400)
+
+        media_dir = get_media_dir("qq")
+        file_path = media_dir / filename
+
+        if not file_path.exists():
+            return web.json_response({"error": "not found"}, status=404)
+
+        # Determine content type
+        suffix = file_path.suffix.lower()
+        content_types = {
+            ".silk": "audio/silk",
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".amr": "audio/amr",
+        }
+        content_type = content_types.get(suffix, "application/octet-stream")
+
+        return web.FileResponse(file_path, headers={"Content-Type": content_type})
+
     async def start(self):
         """Start HTTP server."""
         if not AIOHTTP_AVAILABLE:
@@ -154,6 +182,7 @@ class GatewayHTTPServer:
         logger.info(f"  GET  /health           - Health check")
         logger.info(f"  GET  /agents           - All agents runtime status")
         logger.info(f"  GET  /agents/{{agent_id}} - Single agent detail")
+        logger.info(f"  GET  /media/{{filename}}  - Serve media files (voice etc.)")
 
     async def stop(self):
         """Stop HTTP server."""

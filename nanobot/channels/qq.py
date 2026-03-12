@@ -1,14 +1,18 @@
 """QQ channel implementation using botpy SDK."""
 
 import asyncio
+import uuid
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import QQConfig
 
 try:
@@ -55,13 +59,16 @@ class QQChannel(BaseChannel):
 
     name = "qq"
 
-    def __init__(self, config: QQConfig, bus: MessageBus):
+    def __init__(self, config: QQConfig, bus: MessageBus, groq_api_key: str = ""):
         super().__init__(config, bus)
         self.config: QQConfig = config
+        self.groq_api_key = groq_api_key
         self._client: "botpy.Client | None" = None
         self._processed_ids: deque = deque(maxlen=1000)
         self._msg_seq: int = 1  # 消息序列号，避免被 QQ API 去重
         self._chat_type_cache: dict[str, str] = {}
+        self._voice_chat_cache: dict[str, bool] = {}  # chat_id -> was last msg voice
+        self._tts_provider = None  # lazy init
 
     async def start(self) -> None:
         """Start the QQ bot."""
@@ -76,7 +83,7 @@ class QQChannel(BaseChannel):
         self._running = True
         BotClass = _make_bot_class(self)
         self._client = BotClass()
-        logger.info("QQ bot started (C2C & Group supported)")
+        logger.info("QQ bot started (C2C & Group supported, voice_reply={})", self.config.voice_reply)
         await self._run_bot()
 
     async def _run_bot(self) -> None:
@@ -100,12 +107,24 @@ class QQChannel(BaseChannel):
                 pass
         logger.info("QQ bot stopped")
 
+    # ---- Send ----
+
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through QQ."""
+        """Send a message through QQ (voice or text)."""
         if not self._client:
             logger.warning("QQ client not initialized")
             return
 
+        # If voice_reply is enabled and the last inbound was voice, try voice reply
+        if self.config.voice_reply and self._voice_chat_cache.get(msg.chat_id):
+            sent = await self._send_voice_reply(msg)
+            if sent:
+                return
+
+        await self._send_text(msg)
+
+    async def _send_text(self, msg: OutboundMessage) -> None:
+        """Send a text message."""
         try:
             msg_id = msg.metadata.get("message_id")
             self._msg_seq += 1
@@ -127,7 +146,112 @@ class QQChannel(BaseChannel):
                     msg_seq=self._msg_seq,
                 )
         except Exception as e:
-            logger.error("Error sending QQ message: {}", e)
+            logger.error("Error sending QQ text message: {}", e)
+
+    async def _send_voice_reply(self, msg: OutboundMessage) -> bool:
+        """TTS + format conversion + QQ API voice send.
+
+        Returns True if voice was sent successfully, False to fall back to text.
+        """
+        try:
+            from nanobot.providers.audio_converter import AudioConverter
+            from nanobot.providers.tts import EdgeTTSProvider
+
+            if self._tts_provider is None:
+                self._tts_provider = EdgeTTSProvider(voice=self.config.tts_voice)
+
+            media_dir = get_media_dir("qq")
+            file_id = uuid.uuid4().hex[:12]
+
+            # 1. Edge TTS -> mp3
+            mp3_path = media_dir / f"tts_{file_id}.mp3"
+            ok = await self._tts_provider.synthesize_to_file(msg.content, mp3_path)
+            if not ok:
+                logger.warning("TTS synthesis failed, falling back to text")
+                return False
+
+            # 2. mp3 -> silk
+            silk_path = media_dir / f"tts_{file_id}.silk"
+            ok = await AudioConverter.mp3_to_silk(mp3_path, silk_path)
+            if not ok:
+                logger.warning("mp3->silk conversion failed, falling back to text")
+                mp3_path.unlink(missing_ok=True)
+                return False
+
+            # 3. Upload silk to get a public URL
+            media_url = await self._upload_for_public_url(silk_path)
+            msg_type_cache = self._chat_type_cache.get(msg.chat_id, "c2c")
+            msg_id = msg.metadata.get("message_id")
+            self._msg_seq += 1
+
+            if msg_type_cache == "group":
+                # Group voice: post_group_file -> post_group_message
+                file_info = await self._client.api.post_group_file(
+                    group_openid=msg.chat_id,
+                    file_type=3,  # 3 = voice/silk
+                    url=media_url,
+                )
+                await self._client.api.post_group_message(
+                    group_openid=msg.chat_id,
+                    msg_type=7,  # 7 = media
+                    media=file_info,
+                    msg_id=msg_id,
+                    msg_seq=self._msg_seq,
+                )
+            else:
+                # C2C voice: post_c2c_file -> post_c2c_message
+                file_info = await self._client.api.post_c2c_file(
+                    openid=msg.chat_id,
+                    file_type=3,  # 3 = voice/silk
+                    url=media_url,
+                )
+                await self._client.api.post_c2c_message(
+                    openid=msg.chat_id,
+                    msg_type=7,  # 7 = media
+                    media=file_info,
+                    msg_id=msg_id,
+                    msg_seq=self._msg_seq,
+                )
+
+            logger.info("QQ voice reply sent to {}", msg.chat_id)
+
+            # Cleanup temp files
+            mp3_path.unlink(missing_ok=True)
+            # Keep silk for a while in case QQ needs to re-fetch
+            return True
+
+        except Exception as e:
+            logger.error("QQ voice reply failed: {}, falling back to text", e)
+            return False
+
+    async def _upload_for_public_url(self, file_path: Path) -> str:
+        """Upload a file to a temporary public hosting service and return the direct URL.
+
+        Uses tmpfiles.org (free, no auth required, files expire after ~1 hour).
+        """
+        # tmpfiles.org
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                with open(file_path, "rb") as f:
+                    resp = await client.post(
+                        "https://tmpfiles.org/api/v1/upload",
+                        files={"file": (file_path.name, f, "application/octet-stream")},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("status") == "success":
+                            # Convert page URL to direct download URL
+                            # http://tmpfiles.org/12345/file.silk -> http://tmpfiles.org/dl/12345/file.silk
+                            page_url = data["data"]["url"]
+                            dl_url = page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                            logger.debug("Uploaded to tmpfiles.org: {}", dl_url)
+                            return dl_url
+        except Exception as e:
+            logger.warning("tmpfiles.org upload failed: {}", e)
+
+        raise RuntimeError("Failed to upload file to public hosting service")
+
+    # ---- Receive ----
 
     async def _on_message(self, data: "C2CMessage | GroupMessage", is_group: bool = False) -> None:
         """Handle incoming message from QQ."""
@@ -137,24 +261,163 @@ class QQChannel(BaseChannel):
                 return
             self._processed_ids.append(data.id)
 
+            # Debug: dump full message for diagnostics
+            logger.info("QQ raw message: {}", repr(data))
+
             content = (data.content or "").strip()
-            if not content:
-                return
+            media_files = []
+            is_voice = False
+
+            # Debug: log raw message structure
+            attachments = getattr(data, "attachments", None) or []
+            logger.info(
+                "QQ msg: content={!r}, attachments_count={}, attachments={}",
+                content[:100] if content else content,
+                len(attachments),
+                [repr(a) for a in attachments],
+            )
+
+            # Check attachments for voice
+            for att in attachments:
+                content_type = getattr(att, "content_type", "") or ""
+                url = getattr(att, "url", "") or ""
+                filename = getattr(att, "filename", "") or ""
+                logger.info(
+                    "QQ attachment: content_type={}, url={}, filename={}",
+                    content_type, url[:100] if url else url, filename,
+                )
+                if not url:
+                    continue
+                # Detect voice: by content_type, url suffix, or filename
+                is_audio = (
+                    "audio" in content_type
+                    or content_type == "voice"
+                    or "silk" in content_type
+                    or url.endswith(".amr")
+                    or url.endswith(".silk")
+                    or filename.endswith(".amr")
+                    or filename.endswith(".silk")
+                )
+                if is_audio:
+                    file_path = await self._download_attachment(url, att)
+                    if file_path:
+                        media_files.append(str(file_path))
+                        is_voice = True
+                        # STT transcription (Groq or FunASR)
+                        text = await self._transcribe_voice(file_path)
+                        if text:
+                            content = text
+                            logger.info("QQ voice transcribed: {}...", text[:50])
 
             if is_group:
                 chat_id = data.group_openid
                 user_id = data.author.member_openid
                 self._chat_type_cache[chat_id] = "group"
             else:
-                chat_id = str(getattr(data.author, 'id', None) or getattr(data.author, 'user_openid', 'unknown'))
+                chat_id = str(
+                    getattr(data.author, "id", None)
+                    or getattr(data.author, "user_openid", "unknown")
+                )
                 user_id = chat_id
                 self._chat_type_cache[chat_id] = "c2c"
+
+            self._voice_chat_cache[chat_id] = is_voice
+
+            if not content:
+                if is_voice:
+                    content = "[voice message: transcription unavailable]"
+                else:
+                    return
 
             await self._handle_message(
                 sender_id=user_id,
                 chat_id=chat_id,
                 content=content,
+                media=media_files,
                 metadata={"message_id": data.id},
             )
         except Exception:
             logger.exception("Error handling QQ message")
+
+    async def _download_attachment(self, url: str, att) -> Path | None:
+        """Download an attachment to the local media directory."""
+        try:
+            media_dir = get_media_dir("qq")
+            # Determine file extension from filename, URL, or content_type
+            att_filename = getattr(att, "filename", "") or ""
+            content_type = getattr(att, "content_type", "") or ""
+            if att_filename.endswith(".silk") or ".silk" in url or "silk" in content_type:
+                ext = ".silk"
+            elif att_filename.endswith(".amr") or ".amr" in url or "amr" in content_type:
+                ext = ".amr"
+            else:
+                ext = ".audio"
+
+            filename = f"voice_{uuid.uuid4().hex[:12]}{ext}"
+            file_path = media_dir / filename
+
+            # Ensure url has scheme
+            if url.startswith("//"):
+                url = "https:" + url
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                file_path.write_bytes(resp.content)
+
+            logger.debug("Downloaded QQ attachment: {} ({} bytes)", filename, file_path.stat().st_size)
+            return file_path
+        except Exception as e:
+            logger.error("Failed to download QQ attachment: {}", e)
+            return None
+
+    async def _transcribe_voice(self, file_path: Path) -> str:
+        """Transcribe a voice file: convert -> STT (Groq or FunASR fallback)."""
+        try:
+            from nanobot.providers.audio_converter import AudioConverter
+
+            wav_path = file_path.with_suffix(".wav")
+
+            # Convert to wav based on format
+            if AudioConverter.is_silk_file(file_path) or file_path.suffix == ".silk":
+                ok = await AudioConverter.silk_to_wav(file_path, wav_path)
+            else:
+                ok = await AudioConverter.any_to_wav(file_path, wav_path)
+
+            if not ok:
+                logger.warning("Audio conversion to wav failed for {}", file_path.name)
+                return ""
+
+            text = ""
+
+            # Try Groq first if API key is available
+            if self.groq_api_key:
+                try:
+                    from nanobot.providers.transcription import GroqTranscriptionProvider
+
+                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                    text = await transcriber.transcribe(wav_path)
+                    if text:
+                        logger.debug("Transcribed via Groq Whisper")
+                except Exception as e:
+                    logger.warning("Groq transcription failed: {}, trying FunASR", e)
+
+            # Fallback to FunASR (local model)
+            if not text:
+                try:
+                    from nanobot.providers.stt_funasr import FunASRProvider
+
+                    transcriber = FunASRProvider()
+                    text = await transcriber.transcribe(wav_path)
+                    if text:
+                        logger.debug("Transcribed via FunASR (local)")
+                except Exception as e:
+                    logger.error("FunASR transcription failed: {}", e)
+
+            # Cleanup wav
+            wav_path.unlink(missing_ok=True)
+
+            return text
+        except Exception as e:
+            logger.error("Voice transcription failed: {}", e)
+            return ""
