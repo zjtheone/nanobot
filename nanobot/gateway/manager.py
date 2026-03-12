@@ -273,13 +273,23 @@ class MultiAgentGateway:
         
         try:
             # 使用 process_direct 处理消息
-            await agent.process_direct(
+            response = await agent.process_direct(
                 content=msg.content,
                 session_key=session_key,
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 media=msg.media if msg.media else None,
             )
+
+            # process_direct 返回结果字符串但不发布到 bus outbound，
+            # 需要手动发布以便 ChannelManager._dispatch_outbound 将回复送达 QQ 等渠道
+            if response:
+                from nanobot.bus.events import OutboundMessage
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=response,
+                ))
         except Exception as e:
             logger.error(f"Error processing message in agent {agent_id}: {e}", exc_info=True)
 
