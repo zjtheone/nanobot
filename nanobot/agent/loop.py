@@ -1096,7 +1096,11 @@ class AgentLoop:
 
         reflection_task.add_done_callback(_reflection_done)
 
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        # If message() tool already sent a reply to the user in this turn,
+        # suppress the automatic OutboundMessage to avoid duplication.
+        # BUT: never suppress for A2A channels — the A2A response goes to the
+        # requesting agent, not the user, so it must always be returned.
+        if msg.channel != "a2a" and (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
         return OutboundMessage(
@@ -2023,13 +2027,16 @@ Respond with ONLY valid JSON, no markdown fences."""
         a2a_session_key = f"a2a:{a2a_msg.from_agent}:{a2a_msg.message_id}"
         response = await self._process_message(inbound, session_key=a2a_session_key)
 
-        if response and a2a_msg.type == MessageType.REQUEST:
+        if a2a_msg.type == MessageType.REQUEST:
+            # Always send a response for A2A requests to avoid blocking the
+            # orchestrator's asyncio.gather() indefinitely.
+            response_content = response.content if response else "Task completed (no explicit response)."
             try:
                 await self.a2a_router.send_response(
                     from_agent=self.agent_id,
                     to_agent=a2a_msg.from_agent,
                     request_id=a2a_msg.message_id,
-                    content=response.content,
+                    content=response_content,
                 )
             except Exception as e:
                 logger.error(
