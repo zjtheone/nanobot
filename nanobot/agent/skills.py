@@ -18,6 +18,9 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
+    # Global skills directory shared across all workspaces
+    GLOBAL_SKILLS_DIR = Path.home() / ".nanobot" / "workspace" / "skills"
+
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
@@ -42,6 +45,18 @@ class SkillsLoader:
                     skill_file = skill_dir / "SKILL.md"
                     if skill_file.exists():
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+
+        # Global skills (~/.nanobot/workspace/skills) — shared across workspaces.
+        # Skipped when workspace itself IS the global default to avoid duplicates.
+        if (
+            self.GLOBAL_SKILLS_DIR.exists()
+            and self.GLOBAL_SKILLS_DIR.resolve() != self.workspace_skills.resolve()
+        ):
+            for skill_dir in self.GLOBAL_SKILLS_DIR.iterdir():
+                if skill_dir.is_dir():
+                    skill_file = skill_dir / "SKILL.md"
+                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "global"})
 
         # Built-in skills
         if self.builtin_skills and self.builtin_skills.exists():
@@ -70,6 +85,15 @@ class SkillsLoader:
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
             return workspace_skill.read_text(encoding="utf-8")
+
+        # Check global skills directory
+        if (
+            self.GLOBAL_SKILLS_DIR.exists()
+            and self.GLOBAL_SKILLS_DIR.resolve() != self.workspace_skills.resolve()
+        ):
+            global_skill = self.GLOBAL_SKILLS_DIR / name / "SKILL.md"
+            if global_skill.exists():
+                return global_skill.read_text(encoding="utf-8")
 
         # Check built-in
         if self.builtin_skills:
