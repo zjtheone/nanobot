@@ -1,6 +1,7 @@
 """QQ channel implementation using botpy SDK."""
 
 import asyncio
+import re
 import uuid
 from collections import deque
 from pathlib import Path
@@ -148,6 +149,38 @@ class QQChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending QQ text message: {}", e)
 
+    @staticmethod
+    def _clean_for_tts(text: str) -> str:
+        """Convert markdown text into natural spoken language for TTS."""
+        # Remove code blocks — spoken context doesn't need raw code
+        text = re.sub(r"```[\s\S]*?```", "", text)
+        # Inline code: keep content, drop backticks
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        # Markdown links [text](url) -> just text
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+        # Bare URLs — replace with "链接已省略"
+        text = re.sub(r"https?://\S+", "", text)
+        # Headings: strip # markers, add pause (period) if missing
+        text = re.sub(r"^#{1,6}\s*(.+)$", r"\1。", text, flags=re.MULTILINE)
+        # Bold/italic markers
+        text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+        text = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", text)
+        # Bullet lists: convert to natural sentence flow with pauses
+        text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+        # Numbered lists: keep number for spoken context (e.g. "1、xxx")
+        text = re.sub(r"^\s*(\d+)[.)]\s+", r"\1、", text, flags=re.MULTILINE)
+        # Table dividers and pipes
+        text = re.sub(r"^\s*\|?[-:]+\|[-:|\s]+$", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\|", "，", text)
+        # Blockquotes
+        text = re.sub(r"^\s*>\s*", "", text, flags=re.MULTILINE)
+        # Remaining noisy symbols
+        text = re.sub(r"[~`]", "", text)
+        # Collapse whitespace
+        text = re.sub(r"\n{3,}", "\n", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        return text.strip()
+
     async def _send_voice_reply(self, msg: OutboundMessage) -> bool:
         """TTS + format conversion + QQ API voice send.
 
@@ -163,9 +196,12 @@ class QQChannel(BaseChannel):
             media_dir = get_media_dir("qq")
             file_id = uuid.uuid4().hex[:12]
 
-            # 1. Edge TTS -> mp3
+            # 1. Strip markdown symbols and clean text for TTS
+            tts_text = self._clean_for_tts(msg.content)
+
+            # 2. Edge TTS -> mp3
             mp3_path = media_dir / f"tts_{file_id}.mp3"
-            ok = await self._tts_provider.synthesize_to_file(msg.content, mp3_path)
+            ok = await self._tts_provider.synthesize_to_file(tts_text, mp3_path)
             if not ok:
                 logger.warning("TTS synthesis failed, falling back to text")
                 return False
@@ -308,6 +344,19 @@ class QQChannel(BaseChannel):
                         if text:
                             content = text
                             logger.info("QQ voice transcribed: {}...", text[:50])
+                    continue
+
+                # Detect image: by content_type, url suffix, or filename
+                is_image = (
+                    content_type.startswith("image/")
+                    or any(url.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
+                    or any(filename.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
+                )
+                if is_image:
+                    file_path = await self._download_attachment(url, att)
+                    if file_path:
+                        media_files.append(str(file_path))
+                        logger.info("QQ image downloaded: {}", file_path.name)
 
             if is_group:
                 chat_id = data.group_openid
@@ -326,6 +375,8 @@ class QQChannel(BaseChannel):
             if not content:
                 if is_voice:
                     content = "[voice message: transcription unavailable]"
+                elif media_files:
+                    content = "请描述这张图片"
                 else:
                     return
 
@@ -346,14 +397,30 @@ class QQChannel(BaseChannel):
             # Determine file extension from filename, URL, or content_type
             att_filename = getattr(att, "filename", "") or ""
             content_type = getattr(att, "content_type", "") or ""
+
+            # Image MIME -> extension mapping
+            _IMAGE_EXT_MAP = {
+                "image/jpeg": ".jpg", "image/png": ".png",
+                "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
+            }
+
             if att_filename.endswith(".silk") or ".silk" in url or "silk" in content_type:
                 ext = ".silk"
+                prefix = "voice"
             elif att_filename.endswith(".amr") or ".amr" in url or "amr" in content_type:
                 ext = ".amr"
+                prefix = "voice"
+            elif content_type in _IMAGE_EXT_MAP:
+                ext = _IMAGE_EXT_MAP[content_type]
+                prefix = "image"
+            elif any(att_filename.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+                ext = Path(att_filename).suffix.lower()
+                prefix = "image"
             else:
-                ext = ".audio"
+                ext = ".dat"
+                prefix = "file"
 
-            filename = f"voice_{uuid.uuid4().hex[:12]}{ext}"
+            filename = f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
             file_path = media_dir / filename
 
             # Ensure url has scheme

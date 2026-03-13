@@ -916,6 +916,8 @@ class AgentLoop:
             "total_tokens": 0,
         }
         progress_cb = on_progress or _bus_progress
+        # Track save boundary — updated when compaction changes list length
+        save_from = 1 + len(history)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -927,8 +929,12 @@ class AgentLoop:
                     pass
 
             # Trim context if approaching window limit
+            pre_len = len(initial_messages)
             initial_messages = self._trim_context(initial_messages)
             initial_messages = await self._compact_context(initial_messages)
+            post_len = len(initial_messages)
+            if post_len != pre_len:
+                save_from = max(1, save_from - (pre_len - post_len))
 
             if self.on_status:
                 try:
@@ -1072,7 +1078,7 @@ class AgentLoop:
 
         # Save to session
         is_error = response.finish_reason == "error" if response else False
-        self._save_turn(session, initial_messages, 1 + len(history))
+        self._save_turn(session, initial_messages, save_from)
         self.sessions.save(session)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
