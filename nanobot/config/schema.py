@@ -405,6 +405,26 @@ class SessionVisibilityPolicy(BaseModel):
         return self.visibility == "all"
 
 
+class LspServerConfig(BaseModel):
+    """Configuration for a single LSP server."""
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+    command: list[str] = Field(default_factory=list)  # Override default command
+    disabled: bool = False  # Disable this server
+    initialization_options: dict[str, Any] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)  # Extra env vars
+
+
+class LspConfig(BaseModel):
+    """LSP (Language Server Protocol) configuration."""
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+    enabled: bool = True  # Global LSP enable/disable
+    servers: dict[str, LspServerConfig] = Field(default_factory=dict)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration with A2A support."""
 
@@ -414,6 +434,7 @@ class ToolsConfig(BaseModel):
     agent_to_agent: AgentToAgentPolicy = Field(default_factory=AgentToAgentPolicy)
     sessions: SessionVisibilityPolicy = Field(default_factory=SessionVisibilityPolicy)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    lsp: LspConfig = Field(default_factory=LspConfig)
 
 
 class MemorySearchConfig(BaseModel):

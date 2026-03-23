@@ -15,9 +15,15 @@ class BatchEditTool(Tool):
     Each edit is a {path, old_text, new_text} triple, same as edit_file.
     """
 
-    def __init__(self, checkpoint: CheckpointManager, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        checkpoint: CheckpointManager,
+        allowed_dir: Path | None = None,
+        lsp_manager: Any | None = None,
+    ):
         self._checkpoint = checkpoint
         self._allowed_dir = allowed_dir
+        self._lsp_manager = lsp_manager
 
     @property
     def name(self) -> str:
@@ -117,4 +123,16 @@ class BatchEditTool(Tool):
         diff_text = "\n".join(d for d in diffs if d)
         if diff_text:
             result += f"\n\n{diff_text}"
+
+        # Auto-diagnostics after batch edit
+        if self._lsp_manager:
+            from nanobot.agent.tools.filesystem import _collect_post_edit_diagnostics
+
+            for file_path, _, _, _ in resolved:
+                diag_info = await _collect_post_edit_diagnostics(
+                    self._lsp_manager, str(file_path)
+                )
+                if diag_info:
+                    result += f"\n\n{diag_info}"
+
         return result

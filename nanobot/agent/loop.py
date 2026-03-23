@@ -74,7 +74,12 @@ class AgentLoop:
         serpapi_key: str | None = None,
         search_provider: str = "",
         web_proxy: str | None = None,
+        browser_enabled: bool = False,
+        browser_headless: bool = True,
+        browser_sandbox: bool = True,
+        browser_allow_list: list[str] | None = None,
         exec_config: "ExecToolConfig | None" = None,
+        lsp_config: "LspConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -115,7 +120,12 @@ class AgentLoop:
         self.serpapi_key = serpapi_key
         self.search_provider = search_provider
         self.web_proxy = web_proxy
+        self.browser_enabled = browser_enabled
+        self.browser_headless = browser_headless
+        self.browser_sandbox = browser_sandbox
+        self.browser_allow_list = browser_allow_list or []
         self.exec_config = exec_config or ExecToolConfig()
+        self.lsp_config = lsp_config
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.context_window = context_window
@@ -186,7 +196,9 @@ class AgentLoop:
         # LSP Manager (Phase 7)
         from nanobot.agent.code.lsp import LSPManager
 
-        self.lsp_manager = LSPManager(workspace)
+        self.lsp_manager = LSPManager(
+            workspace, lsp_config=self.lsp_config
+        )
 
         # Metrics Tracker (Phase 9)
         from nanobot.agent.metrics import MetricsTracker
@@ -256,8 +268,7 @@ class AgentLoop:
         # Dynamic skill discovery (P2)
         self.skills_loader = SkillsLoader(workspace)
         self._known_skills: dict[str, str] = {
-            s["name"]: s["source"]
-            for s in self.skills_loader.list_skills(filter_unavailable=False)
+            s["name"]: s["source"] for s in self.skills_loader.list_skills(filter_unavailable=False)
         }
 
         # Skill Evolution Analyzer (P2)
@@ -282,13 +293,47 @@ class AgentLoop:
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
+    def _initialize_skills(self) -> None:
+        """Initialize skills system."""
+        # Check if skills are enabled (default to False for backward compatibility)
+        if not getattr(self, "skills_enabled", False):
+            return
+
+        try:
+            from nanobot.skills.integration import SkillsIntegration
+
+            self.skills_integration = SkillsIntegration(
+                workspace=self.workspace,
+                skills_enabled=True,
+            )
+
+            if self.skills_integration.initialize():
+                logger.info(
+                    f"Skills system initialized ({self.skills_integration.get_eligible_count()} eligible)"
+                )
+        except Exception as e:
+            logger.warning(f"Skills integration failed: {e}")
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools (restrict to workspace if configured)
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir, checkpoint=self.checkpoint))
-        self.tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir, checkpoint=self.checkpoint))
+        self.tools.register(ReadFileTool(
+            workspace=self.workspace, allowed_dir=allowed_dir,
+            lsp_manager=self.lsp_manager,
+        ))
+        self.tools.register(
+            WriteFileTool(
+                workspace=self.workspace, allowed_dir=allowed_dir,
+                checkpoint=self.checkpoint, lsp_manager=self.lsp_manager,
+            )
+        )
+        self.tools.register(
+            EditFileTool(
+                workspace=self.workspace, allowed_dir=allowed_dir,
+                checkpoint=self.checkpoint, lsp_manager=self.lsp_manager,
+            )
+        )
         self.tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
 
         # Undo / checkpoint tools (Phase 1A)
@@ -316,7 +361,15 @@ class AgentLoop:
         # Batch edit tool (Phase 4C)
         from nanobot.agent.tools.batch_edit import BatchEditTool
 
-        self.tools.register(BatchEditTool(self.checkpoint, allowed_dir=allowed_dir))
+        self.tools.register(BatchEditTool(self.checkpoint, allowed_dir=allowed_dir, lsp_manager=self.lsp_manager))
+
+        # Apply patch tool
+        from nanobot.agent.tools.apply_patch import ApplyPatchTool
+
+        self.tools.register(ApplyPatchTool(
+            workspace=self.workspace, allowed_dir=allowed_dir,
+            checkpoint=self.checkpoint, lsp_manager=self.lsp_manager,
+        ))
 
         # Shell tools
         self.tools.register(
@@ -346,12 +399,21 @@ class AgentLoop:
         if hasattr(self.context, "folding_engine") and self.context.folding_engine:
             self.tools.register(ReadFileFocusedTool(self.workspace, self.context.folding_engine))
 
-        # Semantic Search (LSP-Lite) - Phase 7
-        from nanobot.agent.tools.lsp import LSPDefinitionTool, LSPReferencesTool, LSPHoverTool
+        # Semantic Search (LSP) - Phase 7
+        from nanobot.agent.tools.lsp import (
+            LSPDefinitionTool, LSPReferencesTool, LSPHoverTool,
+            LSPDocumentSymbolTool, LSPWorkspaceSymbolTool,
+            LSPImplementationTool, LSPGetDiagnosticsTool, LSPTouchFileTool,
+        )
 
         self.tools.register(LSPDefinitionTool(self.lsp_manager))
         self.tools.register(LSPReferencesTool(self.lsp_manager))
         self.tools.register(LSPHoverTool(self.lsp_manager))
+        self.tools.register(LSPDocumentSymbolTool(self.lsp_manager))
+        self.tools.register(LSPWorkspaceSymbolTool(self.lsp_manager))
+        self.tools.register(LSPImplementationTool(self.lsp_manager))
+        self.tools.register(LSPGetDiagnosticsTool(self.lsp_manager))
+        self.tools.register(LSPTouchFileTool(self.lsp_manager))
 
         # Refactoring Tools (Phase 8)
         from nanobot.agent.tools.refactor import RefactorRenameTool
@@ -384,12 +446,14 @@ class AgentLoop:
 
         # Memory Search Tool (Phase 6)
         from nanobot.agent.tools.memory_search import MemorySearchTool
+
         self.tools.register(MemorySearchTool(self.context.memory))
         self.tools.register(UpdatePlanStepTool(self.planner))
 
         # Wire plan progress callback
         if self.on_plan_progress:
             from dataclasses import asdict
+
             self.planner._on_plan_progress = lambda steps: self.on_plan_progress(
                 [asdict(s) for s in steps]
             )
@@ -401,13 +465,46 @@ class AgentLoop:
         self.tools.register(FindFilesTool(allowed_dir=allowed_dir))
 
         # Web tools
-        self.tools.register(WebSearchTool(
-            api_key=self.brave_api_key,
-            serpapi_key=self.serpapi_key,
-            provider=self.search_provider,
-            proxy=self.web_proxy,
-        ))
+        self.tools.register(
+            WebSearchTool(
+                api_key=self.brave_api_key,
+                serpapi_key=self.serpapi_key,
+                provider=self.search_provider,
+                proxy=self.web_proxy,
+            )
+        )
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+
+        # Browser tool (optional)
+        if self.browser_enabled:
+            try:
+                from nanobot.agent.tools.browser.browser_tool import BrowserTool
+                from nanobot.agent.tools.browser.cdp import BrowserConfig, NavigationGuard
+
+                browser_config = BrowserConfig(
+                    headless=self.browser_headless,
+                    sandbox=self.browser_sandbox,
+                )
+
+                navigation_guard = (
+                    NavigationGuard(self.browser_allow_list) if self.browser_allow_list else None
+                )
+
+                browser_tool = BrowserTool(
+                    config=browser_config,
+                    navigation_guard=navigation_guard is not None,
+                    allow_list=self.browser_allow_list,
+                    headless=self.browser_headless,
+                    sandbox=self.browser_sandbox,
+                )
+                self.tools.register(browser_tool)
+                logger.info(
+                    "Browser tool registered (headless={}, sandbox={})",
+                    self.browser_headless,
+                    self.browser_sandbox,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to register browser tool: {e}")
 
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
@@ -426,21 +523,24 @@ class AgentLoop:
             self.tools.register(aggregate_tool)
             logger.info("Registered Orchestrator tools for agent {}", self.agent_id)
 
+        # Skills integration
+        self._initialize_skills()
+
         # Broadcast tool (for team communication)
-        if self._agents_config:
-            from nanobot.agent.tools.broadcast import BroadcastTool
-            broadcast_tool = BroadcastTool(
-                manager=self.subagents,
-                agents_config=self._agents_config,
-            )
-            broadcast_tool._agent_loop = self
-            broadcast_tool.set_context(
-                channel="cli",
-                chat_id="direct",
-                session_key="cli:direct",
-                agent_id="default",
-            )
-            self.tools.register(broadcast_tool)
+        from nanobot.agent.tools.broadcast import BroadcastTool
+
+        broadcast_tool = BroadcastTool(
+            manager=self.subagents,
+            agents_config=self._agents_config,
+        )
+        broadcast_tool._agent_loop = self
+        broadcast_tool.set_context(
+            channel="cli",
+            chat_id="direct",
+            session_key="cli:direct",
+            agent_id="default",
+        )
+        self.tools.register(broadcast_tool)
 
         # Team task tool (for triggering team collaboration via A2A)
         if self._agents_config:
@@ -476,6 +576,7 @@ class AgentLoop:
 
         # P2 Tools - Re-initialize skill analyzer after tools are registered
         from nanobot.agent.skill_evolution import SkillEvolutionAnalyzer
+
         self.skill_analyzer = SkillEvolutionAnalyzer(
             self.workspace,
             experience_repo=self.experience_repo,
@@ -487,13 +588,15 @@ class AgentLoop:
         self.tools.register(GetSkillEvolutionTool(self.skill_analyzer))
 
         # Combined metrics tool
-        self.tools.register(GetSelfImprovementMetricsTool(
-            self.reflection_engine,
-            self.experience_repo,
-            self.metrics,
-            tool_optimizer=self.tool_optimizer,
-            skill_analyzer=self.skill_analyzer,
-        ))
+        self.tools.register(
+            GetSelfImprovementMetricsTool(
+                self.reflection_engine,
+                self.experience_repo,
+                self.metrics,
+                tool_optimizer=self.tool_optimizer,
+                skill_analyzer=self.skill_analyzer,
+            )
+        )
         logger.info("Registered self-improvement tools (P0/P1/P2)")
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
@@ -513,12 +616,14 @@ class AgentLoop:
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
+
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}...")' if len(val) > 40 else f'{tc.name}("{val}")'
+
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     def _build_role_prompt(self) -> str:
@@ -528,6 +633,7 @@ class AgentLoop:
         # Orchestrator role
         if self.agent_id == "orchestrator":
             from nanobot.agent.team.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT
+
             parts.append(ORCHESTRATOR_SYSTEM_PROMPT)
 
         # Team awareness
@@ -625,13 +731,15 @@ class AgentLoop:
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)
-                        }
+                            "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                        },
                     }
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -651,7 +759,9 @@ class AgentLoop:
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
-                    messages, clean, reasoning_content=response.reasoning_content,
+                    messages,
+                    clean,
+                    reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
                 final_content = clean
@@ -690,15 +800,23 @@ class AgentLoop:
                     task = asyncio.create_task(self._dispatch(msg))
                     self._active_tasks.setdefault(msg.session_key, []).append(task)
                     task.add_done_callback(
-                        lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None
+                        lambda t, k=msg.session_key: (
+                            self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
+                            if t in self._active_tasks.get(k, [])
+                            else None
+                        )
                     )
         finally:
             # Wait for pending reflection tasks
             if self._pending_reflection_tasks:
-                logger.info(f"Waiting for {len(self._pending_reflection_tasks)} pending reflection tasks...")
+                logger.info(
+                    f"Waiting for {len(self._pending_reflection_tasks)} pending reflection tasks..."
+                )
                 done, pending = await asyncio.wait(self._pending_reflection_tasks, timeout=10.0)
                 if pending:
-                    logger.warning(f"{len(pending)} reflection tasks did not complete in time, cancelling")
+                    logger.warning(
+                        f"{len(pending)} reflection tasks did not complete in time, cancelling"
+                    )
                     for t in pending:
                         t.cancel()
 
@@ -728,9 +846,13 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
-        ))
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+            )
+        )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
@@ -740,19 +862,26 @@ class AgentLoop:
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata=msg.metadata or {},
+                        )
+                    )
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
-                ))
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="Sorry, I encountered an error.",
+                    )
+                )
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -867,11 +996,15 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="New session started."
+            )
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="nanobot commands:\n/new -- Start a new conversation\n/stop -- Stop the current task\n/help -- Show available commands")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="nanobot commands:\n/new -- Start a new conversation\n/stop -- Stop the current task\n/help -- Show available commands",
+            )
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -883,7 +1016,9 @@ class AgentLoop:
         # Auto-load frequent skills
         frequent_skills = None
         if self.skill_analyzer:
-            frequent = self.skill_analyzer.get_frequently_used_skills(min_uses=3, min_success_rate=0.5)
+            frequent = self.skill_analyzer.get_frequently_used_skills(
+                min_uses=3, min_success_rate=0.5
+            )
             if frequent:
                 frequent_skills = frequent
                 logger.debug("Auto-loading frequent skills: {}", frequent)
@@ -894,8 +1029,9 @@ class AgentLoop:
             current_message=msg.content,
             skill_names=frequent_skills,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-            plan_context=self.planner.get_progress_context() if hasattr(self, 'planner') else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            plan_context=self.planner.get_progress_context() if hasattr(self, "planner") else None,
         )
         initial_messages = self._inject_role_prompt(initial_messages)
 
@@ -903,9 +1039,14 @@ class AgentLoop:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=meta,
+                )
+            )
 
         # Agent loop
         iteration = 0
@@ -1052,7 +1193,8 @@ class AgentLoop:
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 initial_messages = self.context.add_assistant_message(
-                    initial_messages, clean,
+                    initial_messages,
+                    clean,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -1083,7 +1225,11 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         # Self-Improving: Generate reflection after task completion (P0)
-        task_status = "failure" if is_error else ("success" if iteration < self.max_iterations else "partial_success")
+        task_status = (
+            "failure"
+            if is_error
+            else ("success" if iteration < self.max_iterations else "partial_success")
+        )
 
         reflection_task = asyncio.create_task(
             self._generate_task_reflection(
@@ -1106,7 +1252,12 @@ class AgentLoop:
         # suppress the automatic OutboundMessage to avoid duplication.
         # BUT: never suppress for A2A channels — the A2A response goes to the
         # requesting agent, not the user, so it must always be returned.
-        if msg.channel != "a2a" and (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        if (
+            msg.channel != "a2a"
+            and (mt := self.tools.get("message"))
+            and isinstance(mt, MessageTool)
+            and mt._sent_in_turn
+        ):
             return None
 
         return OutboundMessage(
@@ -1135,7 +1286,9 @@ class AgentLoop:
 
         self._set_tool_context(origin_channel, origin_chat_id, msg.metadata.get("message_id"))
 
-        _frequent = self.skill_analyzer.get_frequently_used_skills() if self.skill_analyzer else None
+        _frequent = (
+            self.skill_analyzer.get_frequently_used_skills() if self.skill_analyzer else None
+        )
         history = session.get_history(max_messages=0)
         messages = self.context.build_messages(
             history=history,
@@ -1152,22 +1305,30 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         return OutboundMessage(
-            channel=origin_channel, chat_id=origin_chat_id,
+            channel=origin_channel,
+            chat_id=origin_chat_id,
             content=final_content or "Background task completed.",
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if (
+                role == "tool"
+                and isinstance(content, str)
+                and len(content) > self._TOOL_RESULT_MAX_CHARS
+            ):
+                entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                if isinstance(content, str) and content.startswith(
+                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                ):
                     parts = content.split("\n\n", 1)
                     if len(parts) > 1 and parts[1].strip():
                         entry["content"] = parts[1]
@@ -1176,10 +1337,15 @@ class AgentLoop:
                 if isinstance(content, list):
                     filtered = []
                     for c in content:
-                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                        if (
+                            c.get("type") == "text"
+                            and isinstance(c.get("text"), str)
+                            and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                        ):
                             continue
-                        if (c.get("type") == "image_url"
-                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
+                        if c.get("type") == "image_url" and c.get("image_url", {}).get(
+                            "url", ""
+                        ).startswith("data:image/"):
                             filtered.append({"type": "text", "text": "[image]"})
                         else:
                             filtered.append(c)
@@ -1220,6 +1386,7 @@ class AgentLoop:
 
         # Execute read-only tools in parallel
         if parallel_indices:
+
             async def _run(idx: int) -> tuple[int, str]:
                 tc = tool_calls[idx]
                 return idx, await self._execute_single_tool(tc.name, tc.arguments)
@@ -1273,13 +1440,15 @@ class AgentLoop:
         self.metrics.record_tool_call(name, success, duration, error_msg)
 
         # Self-Improving: Track tool call for reflection (P0)
-        self._current_task_tool_calls.append({
-            "tool_name": name,
-            "arguments": arguments,
-            "success": success,
-            "duration": duration,
-            "error": error_msg,
-        })
+        self._current_task_tool_calls.append(
+            {
+                "tool_name": name,
+                "arguments": arguments,
+                "success": success,
+                "duration": duration,
+                "error": error_msg,
+            }
+        )
 
         # Self-Improving: Track for tool optimization (P1)
         if self.tool_optimizer:
@@ -1288,7 +1457,9 @@ class AgentLoop:
                 success=success,
                 duration=duration,
                 error=error_msg,
-                task_description=self._current_task_description[:100] if self._current_task_description else None,
+                task_description=self._current_task_description[:100]
+                if self._current_task_description
+                else None,
                 category=self._infer_tool_category(name),
             )
 
@@ -1301,7 +1472,9 @@ class AgentLoop:
                     skill_name=name,
                     success=success,
                     duration=duration,
-                    task_description=self._current_task_description[:200] if self._current_task_description else "",
+                    task_description=self._current_task_description[:200]
+                    if self._current_task_description
+                    else "",
                     error_message=error_msg or "",
                     skill_source=self._known_skills.get(name, "unknown"),
                 )
@@ -1320,7 +1493,10 @@ class AgentLoop:
 
         if any(x in name_lower for x in ["read_file", "write_file", "edit_file", "list_dir"]):
             return "file_operation"
-        elif any(x in name_lower for x in ["web_search", "web_fetch", "grep", "find_files", "find_definitions"]):
+        elif any(
+            x in name_lower
+            for x in ["web_search", "web_fetch", "grep", "find_files", "find_definitions"]
+        ):
             return "search"
         elif any(x in name_lower for x in ["exec", "shell"]):
             return "shell"
@@ -1345,7 +1521,9 @@ class AgentLoop:
 
         if any(x in desc_lower for x in ["code", "function", "class", "import", "def ", "package"]):
             return "code"
-        elif any(x in desc_lower for x in ["file", "read", "write", "create", "delete", "directory"]):
+        elif any(
+            x in desc_lower for x in ["file", "read", "write", "create", "delete", "directory"]
+        ):
             return "file_operation"
         elif any(x in desc_lower for x in ["calculate", "math", "compute", "formula", "equation"]):
             return "math"
@@ -1470,7 +1648,9 @@ class AgentLoop:
 
         verify_msg = f"[Auto-verification] `{verify_cmd}`:\n{result}"
 
-        has_errors = any(w in result.lower() for w in ['error:', 'failed', 'traceback', 'exception'])
+        has_errors = any(
+            w in result.lower() for w in ["error:", "failed", "traceback", "exception"]
+        )
 
         if has_errors:
             verify_msg += "\n\n[SYSTEM CRITICAL] The verification FAILED. You MUST use tools to fix these errors before returning a final answer to the user. Do not stop until it passes."
@@ -1489,7 +1669,12 @@ class AgentLoop:
     ) -> None:
         """Generate reflection report after task completion (P0 - Self-Improving Agent)."""
         task_id = f"task_{int(time.time())}"
-        logger.info("Starting reflection for task {} (status={}, duration={:.2f}s)", task_id, status, duration)
+        logger.info(
+            "Starting reflection for task {} (status={}, duration={:.2f}s)",
+            task_id,
+            status,
+            duration,
+        )
 
         try:
             report = await self.reflection_engine.generate_reflection(
@@ -1499,7 +1684,9 @@ class AgentLoop:
                 duration=duration,
                 tool_calls=self._current_task_tool_calls,
                 tokens_used=tokens_used,
-                errors=[tc.get("error", "") for tc in self._current_task_tool_calls if tc.get("error")],
+                errors=[
+                    tc.get("error", "") for tc in self._current_task_tool_calls if tc.get("error")
+                ],
             )
 
             if report.what_went_well or report.suggested_improvements or report.lessons_learned:
@@ -1511,9 +1698,15 @@ class AgentLoop:
                     task_category=category,
                     success=(status == "success"),
                     input_context=task_description[:500],
-                    solution_approach=", ".join(set(tc.get("tool_name", "") for tc in self._current_task_tool_calls)),
-                    tools_used=list(set(tc.get("tool_name", "") for tc in self._current_task_tool_calls)),
-                    outcome_description=report.lessons_learned[0] if report.lessons_learned else status,
+                    solution_approach=", ".join(
+                        set(tc.get("tool_name", "") for tc in self._current_task_tool_calls)
+                    ),
+                    tools_used=list(
+                        set(tc.get("tool_name", "") for tc in self._current_task_tool_calls)
+                    ),
+                    outcome_description=report.lessons_learned[0]
+                    if report.lessons_learned
+                    else status,
                     key_insights=report.lessons_learned[:3],
                     warnings=report.what_went_poorly[:2],
                     is_generalizable=True,
@@ -1523,7 +1716,7 @@ class AgentLoop:
                 )
                 logger.info("Experience stored in repository")
 
-                if self.confidence_evaluator and hasattr(report, 'confidence_score'):
+                if self.confidence_evaluator and hasattr(report, "confidence_score"):
                     self.confidence_evaluator.record_outcome(
                         question=task_description[:200],
                         predicted_score=report.confidence_score,
@@ -1531,7 +1724,12 @@ class AgentLoop:
                         domain=category,
                     )
 
-            logger.info("Reflection completed: status={}, confidence={:.2f}, insights={}", status, report.confidence_score, len(report.lessons_learned))
+            logger.info(
+                "Reflection completed: status={}, confidence={:.2f}, insights={}",
+                status,
+                report.confidence_score,
+                len(report.lessons_learned),
+            )
 
             # Trigger skill evolution analysis (P2)
             if self.skill_analyzer:
@@ -1543,7 +1741,11 @@ class AgentLoop:
                     evolution_report = self.skill_analyzer.generate_report(period_days=30)
                     self.skill_analyzer._save_report(evolution_report)
 
-                    logger.info("Skill evolution analysis completed: {} skills analyzed, {} gaps identified", len(skill_stats), len(gaps))
+                    logger.info(
+                        "Skill evolution analysis completed: {} skills analyzed, {} gaps identified",
+                        len(skill_stats),
+                        len(gaps),
+                    )
 
                     if gaps:
                         critical_gaps = [g for g in gaps if g.impact == "high"]
@@ -1555,6 +1757,7 @@ class AgentLoop:
                 except Exception as e:
                     logger.error("Skill evolution analysis failed: {}: {}", type(e).__name__, e)
                     import traceback
+
                     logger.debug("Traceback: {}", traceback.format_exc())
 
         except asyncio.TimeoutError:
@@ -1562,6 +1765,7 @@ class AgentLoop:
         except Exception as e:
             logger.error("Task reflection failed: {}: {}", type(e).__name__, e)
             import traceback
+
             logger.debug("Traceback: {}", traceback.format_exc())
         finally:
             self._current_task_tool_calls = []
@@ -1612,7 +1816,9 @@ class AgentLoop:
             content=content,
             media=media,
         )
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(
+            msg, session_key=session_key, on_progress=on_progress
+        )
         return response.content if response else ""
 
     async def process_direct_stream(
@@ -1626,7 +1832,9 @@ class AgentLoop:
         """Process a message with streaming output."""
         session = self.sessions.get_or_create(session_key)
 
-        _frequent = self.skill_analyzer.get_frequently_used_skills() if self.skill_analyzer else None
+        _frequent = (
+            self.skill_analyzer.get_frequently_used_skills() if self.skill_analyzer else None
+        )
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=content,
@@ -1634,7 +1842,7 @@ class AgentLoop:
             media=media,
             channel=channel,
             chat_id=chat_id,
-            plan_context=self.planner.get_progress_context() if hasattr(self, 'planner') else None,
+            plan_context=self.planner.get_progress_context() if hasattr(self, "planner") else None,
         )
         messages = self._inject_role_prompt(messages)
 
@@ -1726,14 +1934,17 @@ class AgentLoop:
                         if not tc_data["args"]:
                             logger.warning(
                                 "Tool call '{}' (id={}) has empty arguments - possible output token truncation",
-                                tc_data['name'], tc_data['id'],
+                                tc_data["name"],
+                                tc_data["id"],
                             )
                             truncated_calls.append(tc_data)
                         args = json.loads(tc_data["args"]) if tc_data["args"] else {}
                     except json.JSONDecodeError as e:
                         logger.warning(
                             "Tool call JSON decode error: name={}, error={}, raw_args={}",
-                            tc_data['name'], e, (tc_data['args'][:200] if tc_data['args'] else 'EMPTY'),
+                            tc_data["name"],
+                            e,
+                            (tc_data["args"][:200] if tc_data["args"] else "EMPTY"),
                         )
                         truncated_calls.append(tc_data)
                         args = {"_raw": tc_data["args"], "_parse_error": str(e)}
@@ -1836,7 +2047,9 @@ class AgentLoop:
             )
 
             if confidence_result.level in ("low", "medium"):
-                confidence_suffix = "\n\n" + self.confidence_evaluator.generate_verification_prompt(confidence_result)
+                confidence_suffix = "\n\n" + self.confidence_evaluator.generate_verification_prompt(
+                    confidence_result
+                )
 
             self.metrics.record_tool_call(
                 tool_name="confidence_evaluation",
@@ -2010,8 +2223,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         content = a2a_msg.content
         if a2a_msg.type == MessageType.REQUEST:
             content = (
-                f"[A2A Request from {a2a_msg.from_agent} "
-                f"(id={a2a_msg.message_id})]\n{content}"
+                f"[A2A Request from {a2a_msg.from_agent} (id={a2a_msg.message_id})]\n{content}"
             )
 
         inbound = InboundMessage(
@@ -2036,7 +2248,9 @@ Respond with ONLY valid JSON, no markdown fences."""
         if a2a_msg.type == MessageType.REQUEST:
             # Always send a response for A2A requests to avoid blocking the
             # orchestrator's asyncio.gather() indefinitely.
-            response_content = response.content if response else "Task completed (no explicit response)."
+            response_content = (
+                response.content if response else "Task completed (no explicit response)."
+            )
             try:
                 await self.a2a_router.send_response(
                     from_agent=self.agent_id,

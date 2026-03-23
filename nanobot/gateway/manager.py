@@ -46,10 +46,10 @@ class MultiAgentGateway:
             f"MultiAgentGateway initialized with {len(config.agents.agent_list)} agents, "
             f"default={config.agents.default_agent}"
         )
-        
+
         # Record start time for uptime calculation
         self._start_time: float | None = None
-        
+
         # HTTP Server
         self._http_server: GatewayHTTPServer | None = None
 
@@ -93,54 +93,53 @@ class MultiAgentGateway:
             task = asyncio.create_task(self._a2a_poll_loop(agent_id, agent))
             self._a2a_poll_tasks[agent_id] = task
         logger.info(f"Started A2A mailbox polling for {len(self._a2a_poll_tasks)} agents")
-        
+
         # 记录启动时间
         self._start_time = asyncio.get_event_loop().time()
-        
+
         # Start HTTP Server (default port 18791)
         self._http_server = GatewayHTTPServer(self, port=18791)
         await self._http_server.start()
-        
+
         logger.info(
             f"MultiAgentGateway started with {len(self.agents)} agents: {list(self.agents.keys())}"
         )
 
-
     async def run_interactive_cli(self):
         """Run interactive CLI for testing message routing."""
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("Gateway started. Type messages to test routing.")
         print("Type 'quit' or 'exit' to exit.")
-        print("="*70 + "\n")
-        
+        print("=" * 70 + "\n")
+
         loop = asyncio.get_event_loop()
-        
+
         while self._running:
             try:
                 message = await loop.run_in_executor(None, input, ">> You: ")
-                
-                if message.lower() in ['quit', 'exit', 'q']:
+
+                if message.lower() in ["quit", "exit", "q"]:
                     print("Exiting interactive CLI.")
                     break
-                
+
                 if not message.strip():
                     continue
-                
+
                 # Create and publish message
                 from nanobot.bus.events import InboundMessage
                 from datetime import datetime
-                
+
                 msg = InboundMessage(
-                    channel='cli',
-                    chat_id='interactive',
+                    channel="cli",
+                    chat_id="interactive",
                     content=message,
-                    sender_id='user',
-                    timestamp=datetime.now()
+                    sender_id="user",
+                    timestamp=datetime.now(),
                 )
-                
+
                 print("\n>> Sending to Gateway...\n")
                 await self.bus.publish_inbound(msg)
-                
+
             except (EOFError, KeyboardInterrupt):
                 print("\nInterrupted.")
                 break
@@ -164,9 +163,9 @@ class MultiAgentGateway:
         await self.a2a_router.close()
 
         # Stop A2A poll tasks
-        for task in getattr(self, '_a2a_poll_tasks', {}).values():
+        for task in getattr(self, "_a2a_poll_tasks", {}).values():
             task.cancel()
-        for task in getattr(self, '_a2a_poll_tasks', {}).values():
+        for task in getattr(self, "_a2a_poll_tasks", {}).values():
             try:
                 await task
             except asyncio.CancelledError:
@@ -191,7 +190,7 @@ class MultiAgentGateway:
         self._health_tasks.clear()
 
         logger.info("MultiAgentGateway stopped")
-    
+
     def get_status(self) -> dict:
         """获取 gateway 和所有 agent 的状态（含运行时详情）。"""
         uptime = 0
@@ -204,7 +203,10 @@ class MultiAgentGateway:
             if hasattr(agent, "get_runtime_status"):
                 agent_details[agent_id] = agent.get_runtime_status()
             else:
-                agent_details[agent_id] = {"agent_id": agent_id, "running": getattr(agent, "_running", False)}
+                agent_details[agent_id] = {
+                    "agent_id": agent_id,
+                    "running": getattr(agent, "_running", False),
+                }
 
         # A2A 路由器摘要
         a2a_registered = list(self.a2a_router._mailboxes.keys()) if self.a2a_router else []
@@ -233,18 +235,18 @@ class MultiAgentGateway:
         else:
             hours = seconds / 3600
             return f"{hours:.1f}小时"
-    
+
     async def _message_dispatcher(self):
         """持续监听 bus 消息并路由到正确的 agent。"""
         from nanobot.bus.events import InboundMessage
-        
+
         # 持续消费 inbound 消息
         while self._running:
             try:
                 msg = await self.bus.consume_inbound()
                 if not self._running:
                     break
-                
+
                 await self._handle_message(msg)
             except Exception as e:
                 logger.error(f"Error routing message: {e}", exc_info=True)
@@ -267,10 +269,10 @@ class MultiAgentGateway:
 
         logger.info(f"\n📥 [{agent_id.upper()}] Routing message from {msg.channel}:{msg.chat_id}")
         logger.info(f"   Content: {msg.content[:80]}...\n")
-        
+
         # 构建带 agent_id 前缀的 session_key
         session_key = f"{agent_id}:{msg.session_key}"
-        
+
         try:
             # 使用 process_direct 处理消息
             response = await agent.process_direct(
@@ -285,11 +287,14 @@ class MultiAgentGateway:
             # 需要手动发布以便 ChannelManager._dispatch_outbound 将回复送达 QQ 等渠道
             if response:
                 from nanobot.bus.events import OutboundMessage
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=response,
-                ))
+
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=response,
+                    )
+                )
         except Exception as e:
             logger.error(f"Error processing message in agent {agent_id}: {e}", exc_info=True)
 
@@ -314,25 +319,27 @@ class MultiAgentGateway:
 
     def _create_agent_loop(self, agent_config: AgentConfig) -> AgentLoop:
         """根据 AgentConfig 创建 AgentLoop 实例。
-        
+
         从 agent_config 提取参数，覆盖 defaults。
         """
         from nanobot.providers.litellm_provider import LiteLLMProvider
         from nanobot.providers.registry import find_by_name
-        
+
         # 确定使用的 model 和 provider
         model = agent_config.model or self.config.agents.defaults.model
         provider_name = self.config.get_provider_name(model)
         provider_config = self.config.get_provider(model)
-        
+
         # 创建 provider
         spec = find_by_name(provider_name) if provider_name else None
         if spec and spec.is_direct:
             from nanobot.providers.custom_provider import CustomProvider
+
             provider = CustomProvider(
                 api_key=provider_config.api_key if provider_config else None,
                 api_base=self.config.get_api_base(model),
                 default_model=model,
+                extra_headers=provider_config.extra_headers if provider_config else None,
             )
         else:
             provider = LiteLLMProvider(
@@ -342,10 +349,10 @@ class MultiAgentGateway:
                 extra_headers=provider_config.extra_headers if provider_config else None,
                 provider_name=provider_name,
             )
-        
+
         # 获取 workspace 路径
         workspace = agent_config.get_workspace_path()
-        
+
         # 创建 AgentLoop
         agent = AgentLoop(
             bus=self.bus,
@@ -359,15 +366,18 @@ class MultiAgentGateway:
             frequency_penalty=agent_config.frequency_penalty,
             context_window=agent_config.context_window,
             exec_config=self.config.tools.exec,
+            lsp_config=self.config.tools.lsp if hasattr(self.config.tools, 'lsp') else None,
             restrict_to_workspace=self.config.tools.restrict_to_workspace,
             session_manager=None,  # TODO: 可能需要为每个 agent 创建独立的 session manager
             sandbox=agent_config.sandbox,
             permission_mode=agent_config.permission_mode,
             thinking_budget=agent_config.thinking_budget,
-            memory_search_config=self.config.memory_search.model_dump() if self.config.memory_search else None,
+            memory_search_config=self.config.memory_search.model_dump()
+            if self.config.memory_search
+            else None,
             agents_config=self.config.agents,  # Pass agents config for Broadcast tool
         )
-        
+
         self.agents[agent_config.id] = agent
 
         # 注入共享 A2A 路由器并注册 agent 的 mailbox
